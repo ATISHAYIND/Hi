@@ -15,3 +15,14 @@ aws route53 list-resource-record-sets \
   --hosted-zone-id "$ZONE_ID" \
   --query "ResourceRecordSets[?Name=='cetera.com.' || Name=='www.cetera.com.']" \
   --output json
+
+
+--------
+
+sleep 10
+
+aws route53 list-resource-record-sets \
+  --profile CFG-NOC-L2-System-Administrator-cfg-network-services-prod-foundation-account \
+  --hosted-zone-id Z0046027160S985P7R2OF \
+  --query "ResourceRecordSets[?Name=='cetera.com.' || Name=='www.cetera.com.']" \
+  --output json
