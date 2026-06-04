@@ -1,0 +1,33 @@
+for profile in $(aws configure list-profiles); do
+  zones=$(aws route53 list-hosted-zones --profile "$profile" \
+    --query "HostedZones[?contains(Name, 'cetera')].Name" --output text 2>/dev/null)
+  if [ -n "$zones" ]; then
+    echo ">>> FOUND in $profile : $zones"
+  fi
+done
+
+
+
+
+----
+
+  for profile in $(aws configure list-profiles); do
+  dist=$(aws cloudfront list-distributions --profile "$profile" \
+    --query "DistributionList.Items[?contains(DomainName, 'd71g9vdd9r6gn')].Id" \
+    --output text 2>/dev/null)
+  if [ -n "$dist" ]; then
+    echo ">>> FOUND in $profile : $dist"
+  fi
+done
+
+
+-----
+
+  for profile in $(aws configure list-profiles); do
+  dist=$(aws cloudfront list-distributions --profile "$profile" \
+    --query "DistributionList.Items[?contains(Aliases.Items, 'cetera.com') || contains(Aliases.Items, 'www.cetera.com')].Id" \
+    --output text 2>/dev/null)
+  if [ -n "$dist" ]; then
+    echo ">>> FOUND in $profile : $dist"
+  fi
+done
