@@ -1,0 +1,109 @@
+#!/usr/bin/env python3
+"""
+Golden AMI parameter ko saare logged-in SSO accounts me push karta hai.
+
+Parameter : /goldenAMI/linux/rhel8/latest
+Value     : ami-0bd5070e28b99a8f6   (jo tumne is account me daala)
+
+Flow: tumhara wahi get_all_profiles() loop -> har logged-in profile me
+SSM put-parameter -> success/fail print.
+"""
+
+import subprocess
+import sys
+import boto3
+from botocore.exceptions import ClientError
+
+# ----------------------- CONFIG -----------------------
+PARAM_NAME  = "/goldenAMI/linux/rhel8/latest"
+PARAM_VALUE = "ami-0bd5070e28b99a8f6"   # <-- confirm kar lo ye sahi value hai
+REGION      = "us-west-2"               # screenshot wale param ka region
+DRY_RUN     = True   # pehle True -> sirf dikhayega kya hoga. Sab sahi lage to False karo.
+# ------------------------------------------------------
+
+
+# ----------- Detect logged-in SSO profiles (tumhara loop) -----------
+def get_all_profiles():
+    try:
+        profiles = subprocess.check_output(
+            ["aws", "configure", "list-profiles"], text=True
+        ).splitlines()
+        if not profiles:
+            raise Exception("No AWS profiles found. Please configure at least one profile.")
+
+        valid_profiles = []
+        for profile in profiles:
+            try:
+                session = boto3.Session(profile_name=profile)
+                sts = session.client("sts")
+                sts.get_caller_identity()
+                valid_profiles.append(profile)
+            except Exception:
+                print(f"  ⚠  Profile '{profile}' not logged in or token expired. Skipping...")
+
+        if not valid_profiles:
+            raise Exception(
+                "No AWS SSO profiles are currently logged in. "
+                "Run 'aws sso login --profile <profile>' for at least one profile."
+            )
+        return valid_profiles
+    except Exception as e:
+        print(f"Error detecting AWS profiles: {e}")
+        sys.exit(1)
+
+
+# ----------- Ek profile me param set karna -----------
+def put_param(profile):
+    session = boto3.Session(profile_name=profile)
+    acct = session.client("sts").get_caller_identity()["Account"]
+    ssm = session.client("ssm", region_name=REGION)
+
+    # current value dekho taaki pata rahe kya badal raha hai
+    try:
+        current = ssm.get_parameter(Name=PARAM_NAME)["Parameter"]["Value"]
+    except ClientError:
+        current = "(not set)"
+
+    if current == PARAM_VALUE:
+        print(f"  ✓ [{acct}] {profile}: already {PARAM_VALUE} — skip")
+        return
+
+    if DRY_RUN:
+        print(f"  → [{acct}] {profile}: {current}  =>  {PARAM_VALUE}   (DRY RUN)")
+        return
+
+    ssm.put_parameter(
+        Name=PARAM_NAME,
+        Value=PARAM_VALUE,
+        Type="String",
+        Overwrite=True,
+    )
+    print(f"  ✓ [{acct}] {profile}: updated  {current}  =>  {PARAM_VALUE}")
+
+
+def main():
+    mode = "DRY RUN (kuch change nahi hoga)" if DRY_RUN else "LIVE (actual update)"
+    print(f"\nMode  : {mode}")
+    print(f"Param : {PARAM_NAME}")
+    print(f"Value : {PARAM_VALUE}")
+    print(f"Region: {REGION}\n")
+
+    profiles = get_all_profiles()
+    print(f"\n{len(profiles)} logged-in profile(s) mile. Chala rahe hain...\n")
+
+    ok, fail = 0, 0
+    for p in profiles:
+        try:
+            put_param(p)
+            ok += 1
+        except Exception as e:
+            print(f"  ✗ {p}: FAILED -> {e}")
+            fail += 1
+
+    print(f"\nDone. Processed: {ok}, Failed: {fail}")
+    if DRY_RUN:
+        print("Ye sirf dry run tha. Output sahi lage to file me DRY_RUN = False karke dobara chalao.")
+
+
+if __name__ == "__main__":
+    main()
