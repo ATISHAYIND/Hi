@@ -19,3 +19,15 @@ for profile in $(aws configure list-profiles); do
     echo ">>> Distribution in $profile : $id"
   fi
 done
+
+
+-------------------\\
+
+sleep 10
+# har account mein dhoondh, is baar errors bhi dikha
+for profile in $(aws configure list-profiles); do
+  result=$(aws cloudfront list-distributions --profile "$profile" \
+    --query "DistributionList.Items[?DomainName=='d7lg9vdd9r6gn.cloudfront.net'].Id" \
+    --output text 2>&1)
+  echo "$profile : $result"
+done
