@@ -1,28 +1,8 @@
-# pehle is account ka zone ID nikaal
-aws route53 list-hosted-zones \
-  --profile CFG-NOC-L2-System-Administrator-cfg-network-services-prod-foundation-account \
-  --query "HostedZones[?Name=='cetera.com.'].[Id,Name]" --output text
+find / -name "server_cert" 2>/dev/null
+ls -la /etc/cohesity*/ 2>/dev/null
+ls -la /opt/cohesity/agent/ 2>/dev/null
+
+ps -ef | grep -oP '(?<=--linux_agent_cert_file_path=)\S+'
 
 
-
-----
-
-# upar wale command se mila ZONE_ID yahan daal
-ZONE_ID="<yahan paste kar>"
-
-aws route53 list-resource-record-sets \
-  --profile CFG-NOC-L2-System-Administrator-cfg-network-services-prod-foundation-account \
-  --hosted-zone-id "$ZONE_ID" \
-  --query "ResourceRecordSets[?Name=='cetera.com.' || Name=='www.cetera.com.']" \
-  --output json
-
-
---------
-
-sleep 10
-
-aws route53 list-resource-record-sets \
-  --profile CFG-NOC-L2-System-Administrator-cfg-network-services-prod-foundation-account \
-  --hosted-zone-id Z0046027160S985P7R2OF \
-  --query "ResourceRecordSets[?Name=='cetera.com.' || Name=='www.cetera.com.']" \
-  --output json
+grep -oP '(?<=certificate: ")[^"]*' <PATH> | head -1 | sed 's/\\n/\n/g' | openssl x509 -noout -issuer -subject -dates
