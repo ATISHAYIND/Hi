@@ -1,0 +1,4 @@
+grep -oP '(?<=certificate: ")[^"]*' /etc/cohesity-agent/server_cert | head -1 | sed 's/\\n/\n/g' | openssl x509 -noout -issuer -subject -dates
+
+
+grep '^certificate:' /etc/cohesity-agent/server_cert | sed -e 's/^[^"]*"//' -e 's/\\n/\n/g' -e 's/"$//' | openssl x509 -noout -issuer -subject -dates
