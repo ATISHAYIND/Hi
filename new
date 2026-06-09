@@ -1,0 +1,8 @@
+head -3 /etc/cohesity-agent/server_cert
+grep "BEGIN" /etc/cohesity-agent/server_cert
+
+
+openssl crl2pkcs7 -nocrl -certfile /etc/cohesity-agent/server_cert | openssl pkcs7 -print_certs -noout
+
+
+openssl x509 -inform DER -in /etc/cohesity-agent/server_cert -noout -issuer -subject -dates
