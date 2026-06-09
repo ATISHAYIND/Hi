@@ -1,0 +1,10 @@
+Hi Eric,
+
+On the Cohesity InsecureClientDetected alerts — this isn't a Linux-side issue, and it isn't a registration issue either (re-registering didn't help).
+
+As confirmed by the Wintel team, backups are completing but with the warning. The root cause is the certificate: the agent is using Cohesity's default self-signed cert (Issuer: O=Cohesity Inc, CN=Cohesity Server) instead of a CA-signed one, so the cluster flags the connection as non-mTLS.
+
+The remediation is on the cluster/certificate side. Suggest confirming the exact cert-replacement steps with Cohesity support for our cluster version.
+
+Regards,
+Atishay
