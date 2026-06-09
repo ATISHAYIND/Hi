@@ -1,2 +1,2 @@
-ls -l /opt/cohesity/agent/certs/ 2>/dev/null
-openssl x509 -in <agent_cert>.pem -noout -issuer -subject -dates
+ls -la /etc/cohesity-agent/
+openssl x509 -in /etc/cohesity-agent/server_cert -noout -issuer -subject -dates
