@@ -1,0 +1,5 @@
+grep -iE "tls|ssl|certificate|handshake|mtls|insecure|x509|verify" /var/log/cohesity/linux_agent_exec.INFO | tail -60
+
+grep -iE "tls|cert|handshake|insecure|verify" /var/log/cohesity/linux_agent_exec.ERROR | tail -40
+
+grep -iE "insecure|mtls|mutual" /var/log/cohesity/linux_agent_exec.INFO | tail -40
