@@ -1,5 +1,5 @@
-grep -iE "tls|ssl|certificate|handshake|mtls|insecure|x509|verify" /var/log/cohesity/linux_agent_exec.INFO | tail -60
+Hi Murali and Navaneethan,
 
-grep -iE "tls|cert|handshake|insecure|verify" /var/log/cohesity/linux_agent_exec.ERROR | tail -40
+As part of the AWS cost optimization audit, we found that the Load Balancers for the mentioned L&R applications have all targets in an unhealthy state, and some do not appear to have any active target groups attached.
 
-grep -iE "insecure|mtls|mutual" /var/log/cohesity/linux_agent_exec.INFO | tail -40
+Could you please confirm whether these Load Balancers are still required? If not, we can proceed with their cleanup as part of the cost-saving initiative.
