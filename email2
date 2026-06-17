@@ -1,0 +1,16 @@
+Hi Team,
+
+During AWS Load Balancer cleanup activities, we identified multiple load balancers associated with the EKS cluster 
+
+These load balancers currently have **no listeners, target groups, or registered targets**. However, deletion is failing with the below error:
+
+**ResourceInUseException: Load balancer cannot be deleted because it is currently associated with another service.**
+
+**Application Team:** Please confirm if this EKS cluster/services are still being used.
+
+**DevOps Team:** Please confirm if any active workloads are running in this cluster and dependent on these load balancers.
+
+Based on your confirmation, we will proceed accordingly.
+
+Thanks,
+Atishay
