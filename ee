@@ -1,0 +1,23 @@
+DevOps/EKS team ko ye message bhej sakte ho:
+
+> Hi Team,
+>
+> I am trying to delete the NLB **k8s-tpm-position-d6b3a7ad80** in **cfg-tpm-eks-dev (us-west-2)**, but AWS is returning:
+>
+> `ResourceInUseException: Load balancer cannot be deleted because it is currently associated with another service.`
+>
+> The NLB has the following Kubernetes-related tags:
+>
+> ```
+> elbv2.k8s.aws/cluster = cfg-tpm-eks-dev
+> service.k8s.aws/resource = LoadBalancer
+> service.k8s.aws/stack = tpm/position-table-nlb-service
+> ```
+>
+> It appears to be an EKS/Kubernetes-managed load balancer. Could you please verify whether the service **tpm/position-table-nlb-service** (or any related Ingress/TargetGroupBinding) still exists and clean up the Kubernetes resource if it is no longer required?
+>
+> I currently do not have Kubernetes object access on the cluster to validate this myself.
+>
+> Thanks.
+
+Ye message unhe exact issue aur probable root cause dono bata dega.
