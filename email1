@@ -1,0 +1,18 @@
+Hi Team,
+
+During the AWS Cost Optimization Audit, we identified the below load balancers with no targets in their target groups. After validation with the Application Team over Teams, a cleanup change (CHG0079406) was raised to decommission these load balancers.
+
+However, while performing the cleanup, deletion failed with the following error:
+
+ResourceInUseException: Load balancer cannot be deleted because it is currently associated with another service.
+
+Further review shows that these load balancers are associated with the EKS cluster cfg-tpm-eks-dev in the cfg-operational-data-dev-account, which is preventing their deletion.
+
+Application Team: Could you please confirm whether this EKS cluster and its associated services are still actively being used by any application?
+
+DevOps Team: Could you please confirm whether there are any active workloads/services running in the cfg-tpm-eks-dev cluster that are dependent on these load balancers?
+
+Based on your confirmation, we will proceed with the cleanup activities.
+
+Thanks,
+Atishay
