@@ -1,10 +1,15 @@
-Hi Eric,
+Hi Team,
 
-On the Cohesity InsecureClientDetected alerts — this isn't a Linux-side issue, and it isn't a registration issue either (re-registering didn't help).
+During our AWS Cost Optimization review, we identified several load balancers that currently do not have any targets associated with them. Upon further investigation, these load balancers appear to be mapped to the EKS cluster **cfg-tpm-eks-dev**.
 
-As confirmed by the Wintel team, backups are completing but with the warning. The root cause is the certificate: the agent is using Cohesity's default self-signed cert (Issuer: O=Cohesity Inc, CN=Cohesity Server) instead of a CA-signed one, so the cluster flags the connection as non-mTLS.
+Before proceeding with the cleanup, we would like to confirm whether these load balancers and the associated EKS services/workloads are still being actively used.
 
-The remediation is on the cluster/certificate side. Suggest confirming the exact cert-replacement steps with Cohesity support for our cluster version.
+**Application Team:** Please confirm whether these resources are still required by the application.
 
-Regards,
-Atishay
+**DevOps Team:** Please confirm whether there are any active workloads/services running in the **cfg-tpm-eks-dev** cluster that depend on these load balancers.
+
+If these resources are no longer in use, kindly confirm so that we can proceed with the cleanup activities.
+
+Thanks,
+Atishay Kushwah
+NOC / Linux Operations
