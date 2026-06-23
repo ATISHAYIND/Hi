@@ -1,0 +1,6 @@
+File	Change
+/etc/login.defs	PASS_MAX_DAYS=365, PASS_MIN_DAYS=1, PASS_MIN_LEN=12, PASS_WARN_AGE=7
+/etc/security/pwquality.conf	Enforced 12-character complexity with upper/lower/numeric/special characters
+/etc/pam.d/system-auth	Verified pam_pwquality.so enforcement
+/etc/pam.d/password-auth	Verified pam_pwquality.so enforcement
+Existing Local Users	Password aging aligned using chage
