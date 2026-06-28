@@ -1,0 +1,1 @@
+chmod +x password_compliance.sh && /bin/bash password_compliance.sh
