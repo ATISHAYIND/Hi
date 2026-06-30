@@ -1,0 +1,12 @@
+Subject: Request to Delete Unused TPM-Dev EKS Cluster for Cost Optimization
+
+Hi Cloud Engineering Team,
+
+As confirmed by the application team in the email thread below, the TPM-Dev EKS cluster and its associated load balancers are no longer in use and can be safely removed.
+
+Could you please proceed with deleting the unused EKS cluster and the associated resources as part of our AWS Cost Optimization initiative?
+
+Kindly let us know once the cleanup has been completed.
+
+Thank you for your support.
+
