@@ -1,0 +1,239 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DevOps Roadmap 2026 — Teleprompter</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,600;12..96,800&family=Hanken+Grotesk:wght@400;500;700&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --bg:#0f1117; --panel:#161a26; --line:#2a3142;
+    --white:#eef1f7; --muted:#8b93a7;
+    --cyan:#22d3ee; --purple:#a78bfa; --pink:#f472b6; --green:#4ade80;
+    --read:2.4rem;            /* spoken-line size, JS-adjustable */
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html,body{height:100%}
+  body{
+    background:var(--bg); color:var(--white);
+    font-family:"Hanken Grotesk",system-ui,sans-serif;
+    overflow:hidden;
+  }
+  /* top brand bar */
+  header{
+    position:fixed; top:0; left:0; right:0; z-index:20;
+    display:flex; align-items:center; gap:.7rem;
+    padding:.7rem 1.1rem;
+    background:linear-gradient(180deg,rgba(15,17,23,.96),rgba(15,17,23,.55) 75%,transparent);
+    backdrop-filter:blur(6px);
+  }
+  header .dot{width:10px;height:10px;border-radius:50%;background:var(--cyan);box-shadow:0 0 12px var(--cyan)}
+  header h1{
+    font-family:"Bricolage Grotesque",sans-serif; font-weight:800;
+    font-size:1rem; letter-spacing:.02em; color:var(--white);
+  }
+  header h1 span{color:var(--cyan)}
+  header .meta{margin-left:auto; color:var(--muted); font-size:.8rem; font-weight:500}
+
+  /* scrolling stage */
+  #stage{
+    height:100%; overflow-y:auto; scroll-behavior:auto;
+    padding:46vh 6vw 60vh;       /* huge top/bottom pad so lines reach center */
+    -webkit-overflow-scrolling:touch;
+  }
+  #stage::-webkit-scrollbar{width:0}
+
+  .block{ margin:0 auto 3.4rem; max-width:1000px; }
+  .cue{
+    display:inline-block;
+    font-family:"Bricolage Grotesque",sans-serif; font-weight:600;
+    font-size:.95rem; letter-spacing:.04em; text-transform:uppercase;
+    color:var(--cyan);
+    border-left:3px solid var(--cyan); padding:.15rem 0 .15rem .8rem;
+    margin-bottom:1rem; opacity:.85;
+  }
+  .line{
+    font-size:var(--read); line-height:1.4; font-weight:500;
+    color:var(--white); letter-spacing:.005em;
+  }
+  .line.long{font-weight:400}
+
+  /* accent variants per scene */
+  .c-purple .cue{color:var(--purple);border-color:var(--purple)}
+  .c-pink   .cue{color:var(--pink);border-color:var(--pink)}
+  .c-green  .cue{color:var(--green);border-color:var(--green)}
+
+  .end{
+    text-align:center; color:var(--muted);
+    font-family:"Bricolage Grotesque",sans-serif; font-weight:600;
+    padding-top:1rem;
+  }
+
+  /* center guide line */
+  .guide{
+    position:fixed; left:0; right:0; top:50%; height:0; z-index:5;
+    border-top:1px dashed rgba(34,211,238,.18); pointer-events:none;
+  }
+
+  /* controls */
+  .bar{
+    position:fixed; bottom:0; left:0; right:0; z-index:20;
+    display:flex; align-items:center; gap:.65rem; flex-wrap:wrap;
+    padding:.7rem 1rem; background:rgba(22,26,38,.95);
+    border-top:1px solid var(--line); backdrop-filter:blur(8px);
+  }
+  button{
+    font-family:"Hanken Grotesk",sans-serif; font-weight:700; font-size:.92rem;
+    color:var(--white); background:#222838; border:1px solid var(--line);
+    padding:.55rem .9rem; border-radius:10px; cursor:pointer;
+    transition:transform .08s ease, background .15s ease;
+  }
+  button:hover{background:#2a3142}
+  button:active{transform:scale(.96)}
+  #play{background:var(--cyan); color:#06222a; border-color:var(--cyan); min-width:108px}
+  #play.on{background:var(--pink); color:#2a0a1c; border-color:var(--pink)}
+  .grp{display:flex; align-items:center; gap:.4rem; color:var(--muted); font-size:.8rem; font-weight:600}
+  input[type=range]{accent-color:var(--cyan); width:120px}
+  .spacer{flex:1}
+  .hint{color:var(--muted); font-size:.74rem}
+  @media (max-width:680px){
+    :root{--read:1.7rem}
+    .hint{display:none}
+    input[type=range]{width:84px}
+  }
+</style>
+</head>
+<body>
+  <header>
+    <span class="dot"></span>
+    <h1>DevOps Roadmap 2026 — <span>Voiceover</span></h1>
+    <span class="meta" id="meta">Video #1 · Intro</span>
+  </header>
+
+  <div class="guide"></div>
+
+  <div id="stage"></div>
+
+  <div class="bar">
+    <button id="play">▶ Play</button>
+    <button id="top">↺ Top</button>
+    <div class="grp">Speed
+      <input id="speed" type="range" min="10" max="120" value="45">
+    </div>
+    <div class="grp">Text
+      <button id="minus" style="padding:.4rem .7rem">A−</button>
+      <button id="plus"  style="padding:.4rem .7rem">A+</button>
+    </div>
+    <div class="spacer"></div>
+    <span class="hint">Space = play/pause · ↑↓ = nudge</span>
+  </div>
+
+<script>
+const script = [
+  { c:"Board: Title — DevOps Roadmap 2026", cls:"", lines:[
+    "DevOps Engineer ki demand aaj har company mein hai — startup se le ke Google, Amazon tak.",
+    "Aur salary? India mein 15 se 25 lakh, US mein lakhon dollar.",
+    "Toh agar tum zero se DevOps seekhna chahte ho — modern tareeke se, 2026 ke tools ke saath — ye series tumhare liye hai.",
+    "95 videos. 9 phases. Completely free."
+  ]},
+  { c:"Board: scroll to — Why most roadmaps fail you", cls:"c-pink", lines:[
+    "Lekin ek problem hai.",
+    "Jab tum YouTube pe DevOps roadmap dhundhte ho, kya milta hai? Purane tools.",
+    "VirtualBox install karo, sab manual karo, teen mahine theory padho — project ek bhi nahi.",
+    "Aur phir interview mein atak jaate ho.",
+    "Main ye series isliye bana raha hoon — kyunki jab main seekh raha tha, mujhe ek bhi complete, modern, hands-on series nahi mili."
+  ]},
+  { c:"Board: scroll to — Old Way vs Our Way", cls:"c-purple", lines:[
+    "Toh is series mein hum kya alag karenge?",
+    "Purana tareeka tha VirtualBox aur manual setup. Hum use karenge WSL2, Docker Desktop, Codespaces — zero overhead.",
+    "Pehle theory teen mahine chalti thi — yahan har phase mein ek real project banega.",
+    "Sirf Jenkins ki jagah hum GitHub Actions, ArgoCD, GitOps seekhenge.",
+    "Aur AI tools bhi — jo aaj industry mein actually use hote hain."
+  ]},
+  { c:"Board: zoom into DevOps loop — DEV ↔ OPS arrows", cls:"", lines:[
+    "Pehle ye samajh lo DevOps hai kya.",
+    "Ek taraf Development — plan karo, code likho, test karo.",
+    "Doosri taraf Operations — deploy karo, monitor karo, scale karo.",
+    "DevOps inn dono ko ek continuous loop mein jodta hai — automation, CI/CD aur monitoring ke saath.",
+    "Bas yahi hai DevOps."
+  ]},
+  { c:"Board: scroll to — Career & Salary cards", cls:"c-green", lines:[
+    "Ab iska faayda.",
+    "India mein fresher 8 se 15 lakh. 3 se 5 saal experience pe 25 se 60 lakh ya zyada.",
+    "US mein median 140 se 180 hazaar dollar. Aur freelance mein 100 se 200 dollar per hour.",
+    "Roles bhi kayi hain — DevOps Engineer, Cloud Engineer, SRE, Platform Engineer."
+  ]},
+  { c:"Board: scroll down the roadmap path — phase by phase", cls:"c-purple", lines:[
+    "Ab pura roadmap dekho.",
+    "Hum shuru karenge Phase 1 — Linux fundamentals, 15 videos.",
+    "Phir networking aur Git. Phir Docker. CI/CD pipelines. Kubernetes.",
+    "Terraform aur Ansible. AWS cloud. Monitoring.",
+    "Aur aakhri phase — advanced topics aur career prep.",
+    "Har phase ke end mein ek real project — jo seedha tumhare GitHub portfolio mein jaayega."
+  ]},
+  { c:"Board: zoom to closing — Start today → Phase 01: Linux", cls:"c-green", lines:[
+    "Toh agar tum tayyar ho — agli video se hum Phase 1 shuru karte hain, Linux ke saath.",
+    "Subscribe kar lo taaki ek bhi video miss na ho.",
+    "Milte hain agli video mein."
+  ]},
+];
+
+const stage = document.getElementById('stage');
+script.forEach(b=>{
+  const div = document.createElement('div');
+  div.className = 'block ' + (b.cls||'');
+  const cue = document.createElement('div');
+  cue.className='cue'; cue.textContent = b.c;
+  div.appendChild(cue);
+  b.lines.forEach(t=>{
+    const p=document.createElement('p');
+    p.className='line'+(t.length>85?' long':'');
+    p.textContent=t;
+    div.appendChild(p);
+  });
+  stage.appendChild(div);
+});
+const end=document.createElement('div');
+end.className='end'; end.textContent='— end of script —';
+stage.appendChild(end);
+
+// ---- auto scroll ----
+let playing=false, last=null;
+const speed=document.getElementById('speed');
+const playBtn=document.getElementById('play');
+
+function step(ts){
+  if(!playing){last=null;return;}
+  if(last==null) last=ts;
+  const dt=(ts-last)/1000; last=ts;
+  const pxPerSec=parseInt(speed.value,10);
+  stage.scrollTop += pxPerSec*dt;
+  if(stage.scrollTop + stage.clientHeight >= stage.scrollHeight-2){ togglePlay(false); }
+  requestAnimationFrame(step);
+}
+function togglePlay(force){
+  playing = (typeof force==='boolean')? force : !playing;
+  playBtn.textContent = playing? '⏸ Pause':'▶ Play';
+  playBtn.classList.toggle('on', playing);
+  if(playing){ last=null; requestAnimationFrame(step); }
+}
+playBtn.onclick=()=>togglePlay();
+document.getElementById('top').onclick=()=>{ stage.scrollTop=0; togglePlay(false); };
+
+// font size
+const root=document.documentElement;
+function readSize(){ return parseFloat(getComputedStyle(root).getPropertyValue('--read')); }
+document.getElementById('plus').onclick =()=>root.style.setProperty('--read',(readSize()+0.25)+'rem');
+document.getElementById('minus').onclick=()=>root.style.setProperty('--read',Math.max(1.2,readSize()-0.25)+'rem');
+
+// keyboard
+window.addEventListener('keydown',e=>{
+  if(e.code==='Space'){e.preventDefault(); togglePlay();}
+  else if(e.code==='ArrowDown'){ stage.scrollTop+=60; }
+  else if(e.code==='ArrowUp'){ stage.scrollTop-=60; }
+});
+</script>
+</body>
+</html>
