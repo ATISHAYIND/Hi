@@ -1,0 +1,10 @@
+Hi Vijay/Venu,
+
+We’ve received a requirement to get basic EKS access for the cluster and worker nodes to perform L1 troubleshooting for alerts such as high CPU, memory, disk utilization, and other basic infrastructure alerts.
+
+Could you please confirm which access requests/permissions we need to raise for:
+
+* EKS Cluster
+* Worker Nodes
+
+Once confirmed, we’ll raise the required requests accordingly.
