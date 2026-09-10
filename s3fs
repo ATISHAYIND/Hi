@@ -1,0 +1,61 @@
+#!/bin/bash
+
+THRESHOLD=70
+MOUNT="/edh_data"
+LOGFILE="/var/log/s3fs_memory_monitor.log"
+
+MEM=$(free | awk '/Mem:/ {print int($3/$2*100)}')
+SWAP=$(free | awk '/Swap:/ {if ($2>0) print int($3/$2*100); else print 0}')
+
+echo "$(date '+%F %T') Memory=${MEM}% Swap=${SWAP}%" >> "$LOGFILE"
+
+if [ "$MEM" -ge "$THRESHOLD" ] || [ "$SWAP" -ge "$THRESHOLD" ]; then
+
+    echo "$(date '+%F %T') Threshold exceeded. Restarting ${MOUNT}" >> "$LOGFILE"
+
+    # 1. Unmount
+    echo "$(date '+%F %T') Unmounting ${MOUNT}" >> "$LOGFILE"
+    fusermount -uz "$MOUNT"
+
+    sleep 5
+
+    # 2. Kill s3fs process for /edh_data
+    PID=$(pgrep -f "s3fs.*cfg-emr-s3-dev-mount /edh_data" | head -1)
+
+    if [ -n "$PID" ]; then
+        echo "$(date '+%F %T') Killing s3fs PID: $PID" >> "$LOGFILE"
+        kill -9 "$PID"
+    else
+        echo "$(date '+%F %T') No s3fs process found for ${MOUNT}" >> "$LOGFILE"
+    fi
+
+    sleep 5
+
+    # 3. Verify unmount
+    if mountpoint -q "$MOUNT"; then
+        echo "$(date '+%F %T') ERROR: ${MOUNT} is still mounted. Remount skipped." >> "$LOGFILE"
+        exit 1
+    fi
+
+    echo "$(date '+%F %T') ${MOUNT} successfully unmounted." >> "$LOGFILE"
+
+    # 4. Remount
+    echo "$(date '+%F %T') Running mount -a" >> "$LOGFILE"
+
+    if mount -a; then
+        echo "$(date '+%F %T') mount -a completed." >> "$LOGFILE"
+    else
+        echo "$(date '+%F %T') ERROR: mount -a failed." >> "$LOGFILE"
+        exit 1
+    fi
+
+    sleep 5
+
+    # 5. Verify remount
+    if mountpoint -q "$MOUNT"; then
+        echo "$(date '+%F %T') ${MOUNT} remounted successfully." >> "$LOGFILE"
+    else
+        echo "$(date '+%F %T') ERROR: ${MOUNT} remount verification failed." >> "$LOGFILE"
+        exit 1
+    fi
+fi
