@@ -1,0 +1,2 @@
+echo 'UUID=c3c8b7d8-a7d3-4f41-b1e2-1d4e9dc8f094 /u01 xfs defaults,nofail 0 0' >> /etc/fstab
+echo 'UUID=7c81b58-939c-4b32-b2e1-ac556ace6d03 /u02 xfs defaults,nofail 0 0' >> /etc/fstab
