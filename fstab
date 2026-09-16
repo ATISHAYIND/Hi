@@ -9,3 +9,6 @@ tail -5 /etc/fstab
 mount -a
 
 df -hT /u01 /u02
+
+
+The requested /u01 (200 GB) and /u02 (200 GB) filesystems have been successfully provisioned and mounted on DDBOAWL003.
