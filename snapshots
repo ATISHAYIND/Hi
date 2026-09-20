@@ -1,1 +1,374 @@
+#!/usr/bin/env python3
+"""
+Safe-to-Delete EBS Snapshot Finder  (READ-ONLY)
+-----------------------------------------------
+Scans every logged-in AWS SSO profile across all enabled regions and reports
+only those snapshots that are confirmed safe to delete.
 
+A snapshot is reported ONLY when ALL of the following are true:
+  1. No AMI owned by the account references it in BlockDeviceMappings
+  2. No existing EBS volume was created from it
+  3. It is older than the age threshold (default 90 days)
+  4. Its state is 'completed'
+  5. It is not managed by AWS Backup or Data Lifecycle Manager
+
+This script performs describe_* calls only. Nothing is ever deleted.
+
+Usage:
+    python3 safe_to_delete_snapshots.py
+    python3 safe_to_delete_snapshots.py --min-age-days 180 --region us-west-2
+"""
+
+import argparse
+import csv
+import os
+import subprocess
+import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
+
+import boto3
+from botocore.config import Config
+
+CFG = Config(retries={"max_attempts": 10, "mode": "adaptive"})
+TS = datetime.now().strftime("%Y%m%d_%H%M%S")
+GB_MONTH_USD = 0.05
+DEFAULT_MIN_AGE_DAYS = 90
+
+COLUMNS = [
+    "Profile", "AccountId", "Region", "SnapshotId", "SourceVolumeId",
+    "SizeGiB", "StartDate", "AgeDays", "Name", "Description",
+    "EstMonthlyUSD", "SafeToDelete", "Reason",
+]
+
+
+# ----------- Detect logged-in SSO profiles -----------
+def get_all_profiles():
+    try:
+        profiles = subprocess.check_output(
+            ["aws", "configure", "list-profiles"], text=True
+        ).splitlines()
+        profiles = [p.strip() for p in profiles if p.strip()]
+        if not profiles:
+            raise Exception("No AWS profiles found. Please configure at least one profile.")
+
+        valid_profiles = []
+        for profile in profiles:
+            try:
+                session = boto3.Session(profile_name=profile)
+                session.client("sts", config=CFG).get_caller_identity()
+                valid_profiles.append(profile)
+            except Exception:
+                print(f"  [SKIP] Profile '{profile}' not logged in or token expired.")
+
+        if not valid_profiles:
+            raise Exception(
+                "No AWS SSO profiles are currently logged in. "
+                "Run 'aws sso login --profile <profile>' for at least one profile."
+            )
+        return valid_profiles
+    except Exception as e:
+        print(f"Error detecting AWS profiles: {e}")
+        sys.exit(1)
+
+
+# ----------- Helpers -----------
+def get_account_id(session):
+    try:
+        return session.client("sts", config=CFG).get_caller_identity()["Account"]
+    except Exception:
+        return "unknown"
+
+
+def get_regions(session, only_region=None):
+    if only_region:
+        return [only_region]
+    try:
+        ec2 = session.client("ec2", region_name="us-east-1", config=CFG)
+        return sorted(r["RegionName"] for r in ec2.describe_regions()["Regions"])
+    except Exception as e:
+        print(f"  [WARN] describe_regions failed ({e}); using fallback region list")
+        return ["us-east-1", "us-west-2", "ap-south-1", "eu-west-1"]
+
+
+def tag_value(tags, key):
+    for t in tags or []:
+        if t.get("Key") == key:
+            return t.get("Value", "")
+    return ""
+
+
+def is_service_managed(snap):
+    """True if the snapshot belongs to AWS Backup or a DLM policy."""
+    desc = snap.get("Description") or ""
+    keys = {t.get("Key", "") for t in (snap.get("Tags") or [])}
+    if any(k.startswith("aws:backup") for k in keys) or "AWS Backup" in desc:
+        return True
+    if any(k.startswith("dlm:") for k in keys) or "Created for policy" in desc:
+        return True
+    return False
+
+
+def build_reason(age_days, min_age_days):
+    return (
+        "No AMI references this snapshot; no EBS volume was created from it; "
+        f"snapshot is {age_days} days old (threshold {min_age_days} days); "
+        "not managed by AWS Backup or DLM."
+    )
+
+
+# ----------- Core scan: one profile + one region -----------
+def scan_region(profile, account_id, region, min_age_days):
+    rows = []
+    skipped = {"in_use": 0, "too_new": 0, "service_managed": 0, "not_completed": 0}
+    try:
+        ec2 = boto3.Session(profile_name=profile, region_name=region).client("ec2", config=CFG)
+
+        snaps = []
+        for page in ec2.get_paginator("describe_snapshots").paginate(OwnerIds=["self"]):
+            snaps.extend(page.get("Snapshots", []))
+        if not snaps:
+            return rows, skipped
+
+        # Condition 1: snapshot IDs referenced by any self-owned AMI
+        ami_snaps = set()
+        for page in ec2.get_paginator("describe_images").paginate(Owners=["self"]):
+            for img in page.get("Images", []):
+                for bdm in img.get("BlockDeviceMappings", []):
+                    sid = bdm.get("Ebs", {}).get("SnapshotId")
+                    if sid:
+                        ami_snaps.add(sid)
+
+        # Condition 2: snapshot IDs that existing EBS volumes were created from
+        vol_snaps = set()
+        for page in ec2.get_paginator("describe_volumes").paginate():
+            for vol in page.get("Volumes", []):
+                if vol.get("SnapshotId"):
+                    vol_snaps.add(vol["SnapshotId"])
+
+        now = datetime.now(timezone.utc)
+        for s in snaps:
+            sid = s["SnapshotId"]
+
+            if s.get("State") != "completed":
+                skipped["not_completed"] += 1
+                continue
+            if sid in ami_snaps or sid in vol_snaps:
+                skipped["in_use"] += 1
+                continue
+
+            started = s.get("StartTime")
+            age = (now - started).days if started else -1
+            if age < min_age_days:
+                skipped["too_new"] += 1
+                continue
+            if is_service_managed(s):
+                skipped["service_managed"] += 1
+                continue
+
+            size = s.get("VolumeSize", 0)
+            rows.append({
+                "Profile": profile,
+                "AccountId": account_id,
+                "Region": region,
+                "SnapshotId": sid,
+                "SourceVolumeId": s.get("VolumeId", ""),
+                "SizeGiB": size,
+                "StartDate": started.strftime("%Y-%m-%d") if started else "",
+                "AgeDays": age,
+                "Name": tag_value(s.get("Tags"), "Name"),
+                "Description": (s.get("Description") or "")[:70],
+                "EstMonthlyUSD": round(size * GB_MONTH_USD, 2),
+                "SafeToDelete": "YES",
+                "Reason": build_reason(age, min_age_days),
+            })
+    except Exception as e:
+        print(f"  [ERROR] {profile}/{region}: {type(e).__name__}: {e}")
+    return rows, skipped
+
+
+# ----------- Report writers -----------
+def write_csv(rows, path):
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=COLUMNS)
+        w.writeheader()
+        w.writerows(rows)
+    return path
+
+
+def write_xlsx(rows, path, min_age_days, skipped):
+    try:
+        from openpyxl import Workbook
+        from openpyxl.styles import Alignment, Font, PatternFill
+        from openpyxl.utils import get_column_letter
+    except ImportError:
+        print("  [INFO] openpyxl not installed, Excel skipped. Install: pip install openpyxl")
+        return None
+
+    head_fill = PatternFill("solid", fgColor="1F3864")
+    ok_fill = PatternFill("solid", fgColor="C6EFCE")
+    bold_white = Font(bold=True, color="FFFFFF")
+
+    total_gb = sum(r["SizeGiB"] for r in rows)
+    monthly = round(total_gb * GB_MONTH_USD, 2)
+
+    wb = Workbook()
+
+    # --- Summary sheet ---
+    ws = wb.active
+    ws.title = "Summary"
+    ws["A1"] = "Safe-to-Delete EBS Snapshot Report"
+    ws["A1"].font = Font(bold=True, size=14)
+    ws["A2"] = "Generated: " + datetime.now().strftime("%d-%b-%Y %H:%M")
+    ws["A2"].font = Font(italic=True, size=9)
+
+    ws.append([])
+    ws.append(["Metric", "Value"])
+    for c in ws[4]:
+        c.font = bold_white
+        c.fill = head_fill
+    for metric, val in [
+        ("Accounts scanned", len({r["AccountId"] for r in rows})),
+        ("Regions with findings", len({r["Region"] for r in rows})),
+        ("Snapshots confirmed safe to delete", len(rows)),
+        ("Reclaimable storage (GiB)", total_gb),
+        ("Estimated monthly saving (USD)", monthly),
+        ("Estimated annual saving (USD)", round(monthly * 12, 2)),
+        ("Minimum age threshold (days)", min_age_days),
+    ]:
+        ws.append([metric, val])
+
+    ws.append([])
+    ws.append(["Snapshots excluded from this report", ""])
+    for c in ws[ws.max_row]:
+        c.font = bold_white
+        c.fill = head_fill
+    for label, key in [
+        ("Referenced by an AMI or an existing EBS volume", "in_use"),
+        (f"Younger than {min_age_days} days", "too_new"),
+        ("Managed by AWS Backup or DLM", "service_managed"),
+        ("Not in 'completed' state", "not_completed"),
+    ]:
+        ws.append([label, skipped.get(key, 0)])
+
+    ws.append([])
+    ws.append(["Deletion criteria applied to every snapshot listed in this report:"])
+    ws[ws.max_row][0].font = Font(bold=True)
+    for line in [
+        "1. No AMI owned by this account references the snapshot in its block device mappings.",
+        "2. No existing EBS volume was created from the snapshot.",
+        "3. The snapshot is older than the age threshold shown above.",
+        "4. The snapshot state is 'completed'.",
+        "5. The snapshot is not managed by AWS Backup or Data Lifecycle Manager.",
+    ]:
+        ws.append([line])
+
+    ws.append([])
+    ws.append(["Note: AMI ownership is checked within this account only. A snapshot shared "
+               "with another account may still back an AMI outside this account."])
+    ws.column_dimensions["A"].width = 52
+    ws.column_dimensions["B"].width = 18
+
+    # --- Detail sheet ---
+    ds = wb.create_sheet("Safe To Delete")
+    ds.append(COLUMNS)
+    for c in ds[1]:
+        c.font = bold_white
+        c.fill = head_fill
+        c.alignment = Alignment(horizontal="center")
+
+    safe_col = COLUMNS.index("SafeToDelete") + 1
+    acct_col = COLUMNS.index("AccountId") + 1
+    for r in rows:
+        ds.append([r[c] for c in COLUMNS])
+        ds.cell(row=ds.max_row, column=safe_col).fill = ok_fill
+        ds.cell(row=ds.max_row, column=safe_col).font = Font(bold=True)
+        ds.cell(row=ds.max_row, column=acct_col).number_format = "@"
+
+    caps = {"Reason": 60, "Description": 40, "SnapshotId": 24,
+            "SourceVolumeId": 24, "Profile": 26}
+    for i, col in enumerate(COLUMNS, 1):
+        widest = max([len(col)] + [len(str(r[col])) for r in rows])
+        ds.column_dimensions[get_column_letter(i)].width = min(widest + 3, caps.get(col, 16))
+    ds.freeze_panes = "A2"
+    ds.auto_filter.ref = ds.dimensions
+
+    wb.save(path)
+    return path
+
+
+# ----------- Main -----------
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--min-age-days", type=int, default=DEFAULT_MIN_AGE_DAYS,
+                    help=f"only report snapshots older than N days (default {DEFAULT_MIN_AGE_DAYS})")
+    ap.add_argument("--region", help="scan a single region instead of all")
+    ap.add_argument("--profile", action="append", help="limit to specific profile(s); repeatable")
+    ap.add_argument("--workers", type=int, default=12)
+    ap.add_argument("--outdir", default=".")
+    args = ap.parse_args()
+
+    print("=" * 78)
+    print("SAFE-TO-DELETE EBS SNAPSHOT FINDER   (read-only)")
+    print(f"Age threshold: snapshots older than {args.min_age_days} days")
+    print("=" * 78)
+
+    profiles = args.profile or get_all_profiles()
+    print(f"\nActive profiles: {len(profiles)}")
+
+    jobs = []
+    for p in profiles:
+        sess = boto3.Session(profile_name=p)
+        acct = get_account_id(sess)
+        for reg in get_regions(sess, args.region):
+            jobs.append((p, acct, reg))
+
+    print(f"Scanning {len(jobs)} profile/region combinations...\n")
+
+    rows = []
+    skipped = {"in_use": 0, "too_new": 0, "service_managed": 0, "not_completed": 0}
+    with ThreadPoolExecutor(max_workers=args.workers) as ex:
+        futs = [ex.submit(scan_region, p, a, r, args.min_age_days) for p, a, r in jobs]
+        for i, fut in enumerate(as_completed(futs), 1):
+            r, sk = fut.result()
+            rows.extend(r)
+            for k in skipped:
+                skipped[k] += sk.get(k, 0)
+            print(f"\r  progress: {i}/{len(jobs)}", end="", flush=True)
+    print("\n")
+
+    if not rows:
+        print(f"No snapshot met all criteria (older than {args.min_age_days} days, "
+              "no AMI, no EBS volume). No report generated.")
+        return
+
+    rows.sort(key=lambda r: (r["Profile"], r["Region"], -r["SizeGiB"]))
+
+    os.makedirs(args.outdir, exist_ok=True)
+    base = os.path.join(args.outdir, f"safe_to_delete_snapshots_{TS}")
+    csv_path = write_csv(rows, base + ".csv")
+    xlsx_path = write_xlsx(rows, base + ".xlsx", args.min_age_days, skipped)
+
+    total_gb = sum(r["SizeGiB"] for r in rows)
+    print("-" * 78)
+    print(f"Confirmed safe to delete : {len(rows)} snapshots")
+    print(f"Reclaimable storage      : {total_gb} GiB")
+    print(f"Estimated saving         : ${round(total_gb * GB_MONTH_USD, 2)}/month  "
+          f"(${round(total_gb * GB_MONTH_USD * 12, 2)}/year)")
+    print(f"Excluded - in use        : {skipped['in_use']}")
+    print(f"Excluded - under {args.min_age_days}d     : {skipped['too_new']}")
+    print(f"Excluded - Backup/DLM    : {skipped['service_managed']}")
+    print("-" * 78)
+    for r in rows[:15]:
+        print(f"  {r['Profile']:<24}{r['Region']:<14}{r['SnapshotId']:<24}"
+              f"{r['SizeGiB']:>6} GiB{r['AgeDays']:>6}d")
+    if len(rows) > 15:
+        print(f"  ... plus {len(rows) - 15} more, see report")
+    print()
+    print(f"CSV   : {csv_path}")
+    if xlsx_path:
+        print(f"Excel : {xlsx_path}")
+
+
+if __name__ == "__main__":
+    main()
