@@ -1,0 +1,306 @@
+#!/usr/bin/env python3
+"""
+Safe-to-delete EBS Snapshot Finder  (READ-ONLY)
+-----------------------------------------------
+
+Usage:
+    python3 safe_to_delete_snapshots.py
+    python3 safe_to_delete_snapshots.py --min-age-days 30 --region ap-south-1
+"""
+
+import argparse
+import csv
+import os
+import subprocess
+import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
+
+import boto3
+from botocore.config import Config
+
+CFG = Config(retries={"max_attempts": 10, "mode": "adaptive"})
+TS = datetime.now().strftime("%Y%m%d_%H%M%S")
+GB_MONTH_USD = 0.05
+
+COLUMNS = [
+    "Profile", "AccountId", "Region", "SnapshotId", "SourceVolumeId",
+    "SizeGiB", "Created", "AgeDays", "Name", "Description",
+    "EstMonthlyUSD", "Flag",
+]
+
+
+# ----------- Detect logged-in SSO profiles (tumhara loop) -----------
+def get_all_profiles():
+    try:
+        profiles = subprocess.check_output(
+            ["aws", "configure", "list-profiles"], text=True
+        ).splitlines()
+        profiles = [p.strip() for p in profiles if p.strip()]
+        if not profiles:
+            raise Exception("No AWS profiles found. Please configure at least one profile.")
+
+        valid_profiles = []
+        for profile in profiles:
+            try:
+                session = boto3.Session(profile_name=profile)
+                sts = session.client("sts", config=CFG)
+                sts.get_caller_identity()
+                valid_profiles.append(profile)
+            except Exception:
+                print(f"  [SKIP] Profile '{profile}' not logged in or token expired.")
+
+        if not valid_profiles:
+            raise Exception(
+                "No AWS SSO profiles are currently logged in. "
+                "Run 'aws sso login --profile <profile>' for at least one profile."
+            )
+        return valid_profiles
+    except Exception as e:
+        print(f"Error detecting AWS profiles: {e}")
+        sys.exit(1)
+
+
+# ----------- Helpers -----------
+def get_account_id(session):
+    try:
+        return session.client("sts", config=CFG).get_caller_identity()["Account"]
+    except Exception:
+        return "unknown"
+
+
+def get_regions(session, only_region=None):
+    if only_region:
+        return [only_region]
+    try:
+        ec2 = session.client("ec2", region_name="us-east-1", config=CFG)
+        return sorted(r["RegionName"] for r in ec2.describe_regions()["Regions"])
+    except Exception as e:
+        print(f"  [WARN] describe_regions failed ({e}); using fallback list")
+        return ["us-east-1", "us-west-2", "ap-south-1", "eu-west-1"]
+
+
+def tag_value(tags, key):
+    for t in tags or []:
+        if t.get("Key") == key:
+            return t.get("Value", "")
+    return ""
+
+
+def managed_flag(snap):
+    """AWS Backup / DLM ke managed snapshots ko warn karo."""
+    desc = snap.get("Description") or ""
+    tags = snap.get("Tags") or []
+    keys = {t.get("Key", "") for t in tags}
+    if any(k.startswith("aws:backup") for k in keys) or "AWS Backup" in desc:
+        return "AWS Backup managed - vault se delete karo, manually nahi"
+    if any(k.startswith("dlm:") for k in keys) or "Created for policy" in desc:
+        return "DLM lifecycle managed - policy se delete hoga"
+    return ""
+
+
+# ----------- Core scan: ek profile + ek region -----------
+def scan_region(profile, account_id, region, min_age_days):
+    rows = []
+    try:
+        ec2 = boto3.Session(profile_name=profile, region_name=region).client("ec2", config=CFG)
+
+        snaps = []
+        for page in ec2.get_paginator("describe_snapshots").paginate(OwnerIds=["self"]):
+            snaps.extend(page.get("Snapshots", []))
+        if not snaps:
+            return rows
+
+        # Condition 1: koi self-owned AMI is snapshot ko refer karti hai?
+        ami_snaps = set()
+        for page in ec2.get_paginator("describe_images").paginate(Owners=["self"]):
+            for img in page.get("Images", []):
+                for bdm in img.get("BlockDeviceMappings", []):
+                    sid = bdm.get("Ebs", {}).get("SnapshotId")
+                    if sid:
+                        ami_snaps.add(sid)
+
+        # Condition 2: koi maujooda EBS volume is snapshot se bana hai?
+        vol_snaps = set()
+        for page in ec2.get_paginator("describe_volumes").paginate():
+            for vol in page.get("Volumes", []):
+                if vol.get("SnapshotId"):
+                    vol_snaps.add(vol["SnapshotId"])
+
+        now = datetime.now(timezone.utc)
+        for s in snaps:
+            sid = s["SnapshotId"]
+            if s.get("State") != "completed":
+                continue
+            if sid in ami_snaps or sid in vol_snaps:
+                continue  # in use -> report me nahi
+
+            started = s.get("StartTime")
+            age = (now - started).days if started else -1
+            if min_age_days and age < min_age_days:
+                continue
+
+            size = s.get("VolumeSize", 0)
+            rows.append({
+                "Profile": profile,
+                "AccountId": account_id,
+                "Region": region,
+                "SnapshotId": sid,
+                "SourceVolumeId": s.get("VolumeId", ""),
+                "SizeGiB": size,
+                "Created": started.strftime("%Y-%m-%d") if started else "",
+                "AgeDays": age,
+                "Name": tag_value(s.get("Tags"), "Name"),
+                "Description": (s.get("Description") or "")[:120],
+                "EstMonthlyUSD": round(size * GB_MONTH_USD, 2),
+                "Flag": managed_flag(s),
+            })
+    except Exception as e:
+        print(f"  [ERR] {profile}/{region}: {type(e).__name__}: {e}")
+    return rows
+
+
+# ----------- Report writers -----------
+def write_csv(rows, path):
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=COLUMNS)
+        w.writeheader()
+        w.writerows(rows)
+    return path
+
+
+def write_xlsx(rows, path):
+    try:
+        from openpyxl import Workbook
+        from openpyxl.styles import Alignment, Font, PatternFill
+        from openpyxl.utils import get_column_letter
+    except ImportError:
+        print("  [INFO] openpyxl nahi mila, Excel skip. Install: pip install openpyxl")
+        return None
+
+    head_fill = PatternFill("solid", fgColor="1F3864")
+    warn_fill = PatternFill("solid", fgColor="FFEB9C")
+    bold_white = Font(bold=True, color="FFFFFF")
+
+    wb = Workbook()
+
+    # --- Summary sheet ---
+    ws = wb.active
+    ws.title = "Summary"
+    total_gb = sum(r["SizeGiB"] for r in rows)
+    monthly = round(sum(r["EstMonthlyUSD"] for r in rows), 2)
+    flagged = sum(1 for r in rows if r["Flag"])
+
+    ws["A1"] = "Safe-to-Delete EBS Snapshots"
+    ws["A1"].font = Font(bold=True, size=14)
+    ws["A2"] = "Generated: " + datetime.now().strftime("%d-%b-%Y %H:%M")
+    ws["A2"].font = Font(italic=True, size=9)
+
+    ws.append([])
+    ws.append(["Metric", "Value"])
+    for c in ws[4]:
+        c.font = bold_white
+        c.fill = head_fill
+    for metric, val in [
+        ("Accounts scanned", len({r["AccountId"] for r in rows})),
+        ("Regions with findings", len({r["Region"] for r in rows})),
+        ("Safe-to-delete snapshots", len(rows)),
+        ("Reclaimable storage (GiB)", total_gb),
+        ("Est. monthly saving (USD)", monthly),
+        ("Est. annual saving (USD)", round(monthly * 12, 2)),
+        ("Needs manual review (Backup/DLM)", flagged),
+    ]:
+        ws.append([metric, val])
+
+    ws.append([])
+    ws.append(["Criteria: snapshot ka na koi self-owned AMI reference hai, "
+               "na koi maujooda EBS volume us se bana hai."])
+    ws.column_dimensions["A"].width = 34
+    ws.column_dimensions["B"].width = 20
+
+    # --- Detail sheet ---
+    ds = wb.create_sheet("Safe To Delete")
+    ds.append(COLUMNS)
+    for c in ds[1]:
+        c.font = bold_white
+        c.fill = head_fill
+        c.alignment = Alignment(horizontal="center")
+
+    for r in rows:
+        ds.append([r[c] for c in COLUMNS])
+        if r["Flag"]:
+            ds.cell(row=ds.max_row, column=COLUMNS.index("Flag") + 1).fill = warn_fill
+
+    for i, col in enumerate(COLUMNS, 1):
+        widest = max([len(col)] + [len(str(r[col])) for r in rows]) + 2
+        ds.column_dimensions[get_column_letter(i)].width = min(widest, 50)
+    ds.freeze_panes = "A2"
+    ds.auto_filter.ref = ds.dimensions
+
+    wb.save(path)
+    return path
+
+
+# ----------- Main -----------
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--min-age-days", type=int, default=0,
+                    help="sirf N din se purane snapshots report karo")
+    ap.add_argument("--region", help="sirf ek region scan karo")
+    ap.add_argument("--profile", action="append", help="specific profile(s); repeatable")
+    ap.add_argument("--workers", type=int, default=12)
+    ap.add_argument("--outdir", default=".")
+    args = ap.parse_args()
+
+    print("=" * 78)
+    print("SAFE-TO-DELETE EBS SNAPSHOT FINDER   (read-only)")
+    print("=" * 78)
+
+    profiles = args.profile or get_all_profiles()
+    print(f"\nActive profiles: {len(profiles)}")
+
+    jobs = []
+    for p in profiles:
+        sess = boto3.Session(profile_name=p)
+        acct = get_account_id(sess)
+        for reg in get_regions(sess, args.region):
+            jobs.append((p, acct, reg))
+
+    print(f"Scanning {len(jobs)} profile/region combinations...\n")
+
+    rows = []
+    with ThreadPoolExecutor(max_workers=args.workers) as ex:
+        futs = [ex.submit(scan_region, p, a, r, args.min_age_days) for p, a, r in jobs]
+        for i, fut in enumerate(as_completed(futs), 1):
+            rows.extend(fut.result())
+            print(f"\r  progress: {i}/{len(jobs)}", end="", flush=True)
+    print("\n")
+
+    if not rows:
+        print("Koi safe-to-delete snapshot nahi mila. Report generate nahi ki.")
+        return
+
+    rows.sort(key=lambda r: (r["Profile"], r["Region"], -r["SizeGiB"]))
+
+    os.makedirs(args.outdir, exist_ok=True)
+    base = os.path.join(args.outdir, f"safe_to_delete_snapshots_{TS}")
+    csv_path = write_csv(rows, base + ".csv")
+    xlsx_path = write_xlsx(rows, base + ".xlsx")
+
+    total_gb = sum(r["SizeGiB"] for r in rows)
+    print("-" * 78)
+    print(f"Safe to delete : {len(rows)} snapshots")
+    print(f"Storage        : {total_gb} GiB")
+    print(f"Est. saving    : ${round(total_gb * GB_MONTH_USD, 2)}/month  "
+          f"(${round(total_gb * GB_MONTH_USD * 12, 2)}/year)")
+    flagged = [r for r in rows if r["Flag"]]
+    if flagged:
+        print(f"Manual review  : {len(flagged)} snapshots Backup/DLM managed hain")
+    print("-" * 78)
+    print(f"CSV   : {csv_path}")
+    if xlsx_path:
+        print(f"Excel : {xlsx_path}")
+
+
+if __name__ == "__main__":
+    main()
