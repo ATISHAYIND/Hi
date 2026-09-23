@@ -1,9 +1,9 @@
-cat /u01/app/oracle/product/19.0.0/dbhome_1/network/admin/listener.ora
+cat /opt/oracle/product/19c/dbhome_1/network/admin/listener.ora
 
-grep -iE 'PORT|HOST|LISTENER' /u01/app/oracle/product/19.0.0/dbhome_1/network/admin/listener.ora
+grep -iE 'PORT|HOST|LISTENER' /opt/oracle/product/19c/dbhome_1/network/admin/listener.ora
 
+/opt/oracle/product/19c/dbhome_1/bin/lsnrctl status
 
-/u01/app/oracle/product/19.0.0/dbhome_1/bin/lsnrctl status
+grep -iE 'PORT|HOST|LISTENER' /opt/oracle/product/19c/dbhome_1/network/admin/listener.ora
 
-
-grep -iE 'PORT|HOST|LISTENER' /u01/app/oracle/product/19.0.0/dbhome_1/network/admin/listener.ora
+/opt/oracle/product/19c/dbhome_1/bin/lsnrctl status
