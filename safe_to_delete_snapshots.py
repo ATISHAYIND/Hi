@@ -305,6 +305,7 @@ def write_xlsx(rows, path, min_age_days, skipped, warnings):
 
     total_gb = sum(r["SizeGiB"] for r in rows)
     monthly = round(total_gb * GB_MONTH_USD, 2)
+    total_seen = len(rows) + sum(skipped.values())
 
     wb = Workbook()
 
@@ -322,7 +323,8 @@ def write_xlsx(rows, path, min_age_days, skipped, warnings):
         c.font = bold_white
         c.fill = head_fill
     for metric, val in [
-        ("Accounts scanned", len({r["AccountId"] for r in rows})),
+        ("Snapshots examined", total_seen),
+        ("Accounts with findings", len({r["AccountId"] for r in rows})),
         ("Regions with findings", len({r["Region"] for r in rows})),
         ("Snapshots confirmed safe to delete", len(rows)),
         ("Reclaimable storage (GiB)", total_gb),
@@ -372,6 +374,10 @@ def write_xlsx(rows, path, min_age_days, skipped, warnings):
     ws.column_dimensions["B"].width = 18
 
     # --- Detail sheet ---
+    if not rows:
+        wb.save(path)
+        return path
+
     ds = wb.create_sheet("Safe To Delete")
     ds.append(COLUMNS)
     for c in ds[1]:
@@ -441,9 +447,30 @@ def main():
             print(f"\r  progress: {i}/{len(jobs)}", end="", flush=True)
     print("\n")
 
+    total_seen = len(rows) + sum(skipped.values())
+    print("-" * 78)
+    print(f"Snapshots examined       : {total_seen}")
+    print(f"Confirmed safe to delete : {len(rows)}")
+    print("Excluded:")
+    for key, label in SKIP_KEYS:
+        print(f"  {label:<62}{skipped.get(key, 0):>6}")
+    if warnings:
+        print("Warnings:")
+        for w in sorted(set(warnings)):
+            print(f"  ! {w}")
+    print("-" * 78)
+
     if not rows:
-        print(f"No snapshot met all criteria (older than {args.min_age_days} days, "
-              "no AMI, no EBS volume, not locked, not shared). No report generated.")
+        print(f"\nNo snapshot met all criteria (older than {args.min_age_days} days, "
+              "no AMI, no EBS volume, not locked, not shared).")
+        if skipped.get("service_managed", 0) > total_seen * 0.5:
+            print("Most snapshots in scope are managed by AWS Backup or DLM. Those cannot "
+                  "be deleted from the EC2 console; reduce retention in the backup plan or "
+                  "delete recovery points from the vault instead.")
+        os.makedirs(args.outdir, exist_ok=True)
+        empty = os.path.join(args.outdir, f"safe_to_delete_snapshots_{TS}_summary_only.xlsx")
+        if write_xlsx([], empty, args.min_age_days, skipped, warnings):
+            print(f"\nSummary-only Excel written: {empty}")
         return
 
     rows.sort(key=lambda r: (r["Profile"], r["Region"], -r["SizeGiB"]))
@@ -454,19 +481,9 @@ def main():
     xlsx_path = write_xlsx(rows, base + ".xlsx", args.min_age_days, skipped, warnings)
 
     total_gb = sum(r["SizeGiB"] for r in rows)
-    print("-" * 78)
-    print(f"Confirmed safe to delete : {len(rows)} snapshots")
     print(f"Reclaimable storage      : {total_gb} GiB")
     print(f"Estimated saving         : ${round(total_gb * GB_MONTH_USD, 2)}/month  "
           f"(${round(total_gb * GB_MONTH_USD * 12, 2)}/year)")
-    print("Excluded:")
-    for key, label in SKIP_KEYS:
-        print(f"  {label:<62}{skipped.get(key, 0):>6}")
-    if warnings:
-        print("Warnings:")
-        for w in sorted(set(warnings)):
-            print(f"  ! {w}")
-    print("-" * 78)
     for r in rows[:15]:
         print(f"  {r['Profile']:<24}{r['Region']:<14}{r['SnapshotId']:<24}"
               f"{r['SizeGiB']:>6} GiB{r['AgeDays']:>6}d")
