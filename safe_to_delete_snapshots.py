@@ -1,31 +1,37 @@
 #!/usr/bin/env python3
 """
-Safe-to-Delete EBS Snapshot Finder  (READ-ONLY)
------------------------------------------------
-Scans every logged-in AWS SSO profile across all enabled regions and reports
-only snapshots that can actually be deleted from the EC2 console without error.
+Old AMI + Snapshot Cleanup Report  (READ-ONLY)
+----------------------------------------------
+Most EBS snapshots in a daily-backup environment are held by an AMI, so they
+cannot be deleted at snapshot level. The deletable unit is the AMI. This report
+finds AMIs that are safe to remove, and lists the snapshots that each one frees.
 
-A snapshot is reported ONLY when ALL of the following are true:
-  1. No AMI in this account references it - deprecated and DISABLED AMIs included
-  2. No existing EBS volume was created from it
-  3. Older than the age threshold (default 90 days)
-  4. State is 'completed'
-  5. Not managed by AWS Backup or Data Lifecycle Manager
-  6. Not protected by an EBS snapshot lock
-  7. Not public and not shared with any other AWS account
+Safety rules applied to every AMI listed:
+  1. The AMI is older than the age threshold (default 90 days)
+  2. Its source resource still has newer AMIs - the most recent ones are kept
+     (default: 2 newest per resource, set with --keep)
+  3. The AMI is not used by any instance, launch template, or launch configuration
+  4. Every snapshot it holds is also older than the age threshold
+  5. Snapshots shared by an AMI that is being kept are never listed
 
-This script performs describe_* calls only. Nothing is ever deleted.
+An AMI whose source resource cannot be determined is never listed, because its
+retention group cannot be verified.
+
+This script performs describe_* calls only. Nothing is ever deleted or
+deregistered.
 
 Usage:
-    python3 safe_to_delete_snapshots.py
-    python3 safe_to_delete_snapshots.py --min-age-days 180 --region us-west-2
+    python3 old_ami_cleanup_report.py
+    python3 old_ami_cleanup_report.py --min-age-days 180 --keep 3
 """
 
 import argparse
 import csv
 import os
+import re
 import subprocess
 import sys
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
@@ -36,21 +42,28 @@ CFG = Config(retries={"max_attempts": 10, "mode": "adaptive"})
 TS = datetime.now().strftime("%Y%m%d_%H%M%S")
 GB_MONTH_USD = 0.05
 DEFAULT_MIN_AGE_DAYS = 90
+DEFAULT_KEEP = 2
 
-COLUMNS = [
-    "Profile", "AccountId", "Region", "SnapshotId", "SourceVolumeId",
-    "SizeGiB", "StartDate", "AgeDays", "Name", "Description",
-    "EstMonthlyUSD", "SafeToDelete", "Reason",
+CREATE_IMAGE_RE = re.compile(r"CreateImage\((i-[0-9a-f]+)\)")
+
+AMI_COLUMNS = [
+    "Profile", "AccountId", "Region", "AmiId", "AmiName", "AmiCreated", "AmiAgeDays",
+    "AmiOwner", "SourceResource", "AmisInGroup", "NewerAmisKept", "NewestKeptAmi",
+    "NewestKeptDate", "InUse", "SnapshotCount", "SnapshotGiB", "EstMonthlyUSD", "Action",
+]
+
+SNAP_COLUMNS = [
+    "Profile", "AccountId", "Region", "SnapshotId", "HeldByAmi", "SourceResource",
+    "SizeGiB", "StartDate", "AgeDays", "EstMonthlyUSD", "Action",
 ]
 
 SKIP_KEYS = [
-    ("in_use_ami", "Referenced by an AMI (including deprecated and disabled AMIs)"),
-    ("in_use_volume", "An existing EBS volume was created from it"),
-    ("too_new", "Younger than the age threshold"),
-    ("service_managed", "Managed by AWS Backup or DLM - delete via vault or policy"),
-    ("locked", "Protected by an EBS snapshot lock"),
-    ("shared_or_public", "Shared with another account or public"),
-    ("not_completed", "Not in 'completed' state"),
+    ("too_new", "AMI younger than the age threshold"),
+    ("kept_recent", "Kept as one of the newest AMIs for its source resource"),
+    ("in_use", "In use by an instance, launch template, or launch configuration"),
+    ("no_group", "Source resource could not be determined - not evaluated"),
+    ("only_copy", "Only AMI for its source resource - never removed"),
+    ("young_snapshot", "Holds at least one snapshot younger than the threshold"),
 ]
 
 
@@ -84,7 +97,6 @@ def get_all_profiles():
         sys.exit(1)
 
 
-# ----------- Helpers -----------
 def get_account_id(session):
     try:
         return session.client("sts", config=CFG).get_caller_identity()["Account"]
@@ -110,187 +122,269 @@ def tag_value(tags, key):
     return ""
 
 
-def is_service_managed(snap):
-    """AWS Backup / DLM snapshots cannot be deleted from the EC2 console."""
-    desc = snap.get("Description") or ""
-    keys = {t.get("Key", "") for t in (snap.get("Tags") or [])}
-    if any(k.startswith("aws:backup") for k in keys) or "AWS Backup" in desc:
-        return True
-    if any(k.startswith("dlm:") for k in keys) or "Created for policy" in desc:
-        return True
-    return False
+# ----------- Grouping: which server does this AMI belong to? -----------
+def source_resource(img):
+    """
+    Identify the resource an AMI was created from, so AMIs of the same server
+    can be grouped and the newest ones kept. Returns None when unknown.
+    """
+    tags = img.get("Tags") or []
+
+    # AWS Backup tags the source instance/volume ARN on the AMI
+    for key in ("aws:backup:source-resource", "aws:backup:source-resource-arn"):
+        val = tag_value(tags, key)
+        if val:
+            return val.split("/")[-1]
+
+    # CreateImage writes the source instance id into the description
+    m = CREATE_IMAGE_RE.search(img.get("Description") or "")
+    if m:
+        return m.group(1)
+
+    # Golden AMI pipelines usually keep a stable Name tag with a date suffix
+    name_tag = tag_value(tags, "Name")
+    if name_tag:
+        return re.sub(r"[-_ ]?\d{4}[-_]?\d{2}[-_]?\d{2}.*$", "", name_tag).strip("-_ ") or name_tag
+
+    # AWS Backup AMI names look like AwsBackup_i-0abc123_...
+    name = img.get("Name") or ""
+    m = re.search(r"(i-[0-9a-f]+)", name)
+    if m:
+        return m.group(1)
+
+    return None
 
 
-def get_ami_referenced_snapshots(ec2, warnings):
-    """
-    Snapshot IDs referenced by AMIs in this account.
-    IncludeDisabled/IncludeDeprecated are critical: a disabled AMI still blocks
-    deletion but is hidden from describe_images by default.
-    """
-    referenced = set()
-    kwargs = {"Owners": ["self"], "IncludeDisabled": True, "IncludeDeprecated": True}
+def get_images(ec2, warnings, profile, region):
+    """All AMIs visible to this account, tagged with their owner class."""
+    images = []
     try:
-        pages = ec2.get_paginator("describe_images").paginate(**kwargs)
-        images = [img for page in pages for img in page.get("Images", [])]
+        pages = ec2.get_paginator("describe_images").paginate(
+            Owners=["self"], IncludeDisabled=True, IncludeDeprecated=True)
+        for page in pages:
+            for img in page.get("Images", []):
+                img["_owner_class"] = "self"
+                images.append(img)
     except Exception as e:
-        warnings.append(f"describe_images with IncludeDisabled failed ({e}); "
-                        "retrying without it - disabled AMIs may be missed")
+        warnings.append(f"{profile}/{region}: describe_images with IncludeDisabled failed "
+                        f"({type(e).__name__}); disabled AMIs may be missed")
         pages = ec2.get_paginator("describe_images").paginate(Owners=["self"])
-        images = [img for page in pages for img in page.get("Images", [])]
+        for page in pages:
+            for img in page.get("Images", []):
+                img["_owner_class"] = "self"
+                images.append(img)
 
-    # AMIs created by AWS Backup are owned by the aws-backup-vault alias
     try:
         pages = ec2.get_paginator("describe_images").paginate(Owners=["aws-backup-vault"])
-        images += [img for page in pages for img in page.get("Images", [])]
+        for page in pages:
+            for img in page.get("Images", []):
+                img["_owner_class"] = "aws-backup-vault"
+                images.append(img)
+    except Exception:
+        pass
+    return images
+
+
+def get_amis_in_use(ec2, warnings, profile, region):
+    """AMI IDs referenced by instances, launch templates, or launch configurations."""
+    in_use = set()
+    try:
+        for page in ec2.get_paginator("describe_instances").paginate():
+            for res in page.get("Reservations", []):
+                for inst in res.get("Instances", []):
+                    if inst.get("State", {}).get("Name") != "terminated" and inst.get("ImageId"):
+                        in_use.add(inst["ImageId"])
+    except Exception as e:
+        warnings.append(f"{profile}/{region}: describe_instances failed ({type(e).__name__}); "
+                        "in-use AMIs may be missed")
+
+    try:
+        for page in ec2.get_paginator("describe_launch_templates").paginate():
+            for lt in page.get("LaunchTemplates", []):
+                try:
+                    vers = ec2.describe_launch_template_versions(
+                        LaunchTemplateId=lt["LaunchTemplateId"],
+                        Versions=["$Latest", "$Default"])
+                    for v in vers.get("LaunchTemplateVersions", []):
+                        img = (v.get("LaunchTemplateData") or {}).get("ImageId")
+                        if img:
+                            in_use.add(img)
+                except Exception:
+                    continue
     except Exception:
         pass
 
-    for img in images:
-        for bdm in img.get("BlockDeviceMappings", []):
-            sid = bdm.get("Ebs", {}).get("SnapshotId")
-            if sid:
-                referenced.add(sid)
-    return referenced
-
-
-def get_locked_snapshots(ec2, warnings):
-    """Snapshot IDs under an EBS snapshot lock - these cannot be deleted by anyone."""
-    locked = set()
     try:
-        token = None
-        while True:
-            kwargs = {"MaxResults": 200}
-            if token:
-                kwargs["NextToken"] = token
-            resp = ec2.describe_locked_snapshots(**kwargs)
-            for s in resp.get("Snapshots", []):
-                if s.get("LockState") in ("compliance", "governance", "compliance-cooloff"):
-                    locked.add(s["SnapshotId"])
-            token = resp.get("NextToken")
-            if not token:
-                break
-    except Exception as e:
-        warnings.append(f"describe_locked_snapshots unavailable ({type(e).__name__}); "
-                        "locked snapshots were not filtered out")
-    return locked
-
-
-def is_shared_or_public(ec2, snapshot_id):
-    """True if the snapshot is public or shared with another account."""
-    try:
-        perms = ec2.describe_snapshot_attribute(
-            SnapshotId=snapshot_id, Attribute="createVolumePermission"
-        ).get("CreateVolumePermissions", [])
-        return bool(perms)
+        asg = boto3.Session(profile_name=profile, region_name=region).client(
+            "autoscaling", config=CFG)
+        for page in asg.get_paginator("describe_launch_configurations").paginate():
+            for lc in page.get("LaunchConfigurations", []):
+                if lc.get("ImageId"):
+                    in_use.add(lc["ImageId"])
     except Exception:
-        return False  # cannot confirm sharing; do not block on a failed check
+        pass
 
-
-def build_reason(age_days, min_age_days):
-    return (
-        "No AMI in this account references this snapshot (deprecated and disabled AMIs "
-        "checked); no EBS volume was created from it; not managed by AWS Backup or DLM; "
-        "no snapshot lock; not shared or public; state is completed; "
-        f"snapshot is {age_days} days old (threshold {min_age_days} days)."
-    )
+    return in_use
 
 
 # ----------- Core scan: one profile + one region -----------
-def scan_region(profile, account_id, region, min_age_days):
-    rows = []
+def scan_region(profile, account_id, region, min_age_days, keep):
+    ami_rows, snap_rows, warnings = [], [], []
     skipped = {k: 0 for k, _ in SKIP_KEYS}
-    warnings = []
     try:
         ec2 = boto3.Session(profile_name=profile, region_name=region).client("ec2", config=CFG)
 
-        snaps = []
+        images = get_images(ec2, warnings, profile, region)
+        if not images:
+            return ami_rows, snap_rows, skipped, warnings
+
+        snap_info = {}
         for page in ec2.get_paginator("describe_snapshots").paginate(OwnerIds=["self"]):
-            snaps.extend(page.get("Snapshots", []))
-        if not snaps:
-            return rows, skipped, warnings
+            for s in page.get("Snapshots", []):
+                snap_info[s["SnapshotId"]] = s
 
-        ami_snaps = get_ami_referenced_snapshots(ec2, warnings)
-
-        vol_snaps = set()
-        for page in ec2.get_paginator("describe_volumes").paginate():
-            for vol in page.get("Volumes", []):
-                if vol.get("SnapshotId"):
-                    vol_snaps.add(vol["SnapshotId"])
-
-        locked_snaps = get_locked_snapshots(ec2, warnings)
-
+        in_use = get_amis_in_use(ec2, warnings, profile, region)
         now = datetime.now(timezone.utc)
-        candidates = []
-        for s in snaps:
-            sid = s["SnapshotId"]
 
-            if s.get("State") != "completed":
-                skipped["not_completed"] += 1
+        # Group AMIs by their source resource, newest first
+        groups = defaultdict(list)
+        for img in images:
+            created = img.get("CreationDate")
+            try:
+                img["_created"] = datetime.strptime(created, "%Y-%m-%dT%H:%M:%S.%fZ").replace(
+                    tzinfo=timezone.utc)
+            except Exception:
+                try:
+                    img["_created"] = datetime.strptime(created, "%Y-%m-%dT%H:%M:%SZ").replace(
+                        tzinfo=timezone.utc)
+                except Exception:
+                    img["_created"] = None
+            key = source_resource(img)
+            if not key:
+                skipped["no_group"] += 1
                 continue
-            if sid in ami_snaps:
-                skipped["in_use_ami"] += 1
+            groups[key].append(img)
+
+        candidates = []  # (img, group_key, group_size, kept_list)
+        for key, imgs in groups.items():
+            imgs = [i for i in imgs if i["_created"]]
+            if not imgs:
                 continue
-            if sid in vol_snaps:
-                skipped["in_use_volume"] += 1
+            imgs.sort(key=lambda i: i["_created"], reverse=True)
+
+            if len(imgs) <= keep:
+                # Nothing to remove: this resource has only its protected recent copies
+                skipped["only_copy"] += len(imgs)
                 continue
 
-            started = s.get("StartTime")
-            age = (now - started).days if started else -1
-            if age < min_age_days:
-                skipped["too_new"] += 1
-                continue
-            if is_service_managed(s):
-                skipped["service_managed"] += 1
-                continue
-            if sid in locked_snaps:
-                skipped["locked"] += 1
-                continue
-            candidates.append((s, age))
+            kept, older = imgs[:keep], imgs[keep:]
+            for img in older:
+                age = (now - img["_created"]).days
+                if age < min_age_days:
+                    skipped["too_new"] += 1
+                    continue
+                if img["ImageId"] in in_use:
+                    skipped["in_use"] += 1
+                    continue
+                candidates.append((img, key, len(imgs), kept))
+            skipped["kept_recent"] += len(kept)
 
-        # Sharing check: one extra API call per surviving candidate
-        if candidates:
-            with ThreadPoolExecutor(max_workers=8) as ex:
-                shared_flags = list(ex.map(
-                    lambda c: is_shared_or_public(ec2, c[0]["SnapshotId"]), candidates))
-        else:
-            shared_flags = []
-
-        for (s, age), shared in zip(candidates, shared_flags):
-            if shared:
-                skipped["shared_or_public"] += 1
+        # Snapshots held by AMIs that are NOT candidates must never be listed
+        candidate_ids = {img["ImageId"] for img, _, _, _ in candidates}
+        protected_snaps = set()
+        for img in images:
+            if img["ImageId"] in candidate_ids:
                 continue
-            size = s.get("VolumeSize", 0)
-            started = s.get("StartTime")
-            rows.append({
+            for bdm in img.get("BlockDeviceMappings", []):
+                sid = (bdm.get("Ebs") or {}).get("SnapshotId")
+                if sid:
+                    protected_snaps.add(sid)
+
+        for img, key, group_size, kept in candidates:
+            age = (now - img["_created"]).days
+            sids = [(bdm.get("Ebs") or {}).get("SnapshotId")
+                    for bdm in img.get("BlockDeviceMappings", [])]
+            sids = [s for s in sids if s]
+
+            # Every snapshot this AMI holds must itself be old enough
+            too_young = False
+            usable = []
+            for sid in sids:
+                s = snap_info.get(sid)
+                if not s:
+                    continue  # snapshot not owned by this account
+                s_age = (now - s["StartTime"]).days
+                if s_age < min_age_days:
+                    too_young = True
+                    break
+                usable.append((sid, s, s_age))
+            if too_young:
+                skipped["young_snapshot"] += 1
+                continue
+
+            free_now = [(sid, s, a) for sid, s, a in usable if sid not in protected_snaps]
+            total_gb = sum(s.get("VolumeSize", 0) for _, s, _ in free_now)
+            backup_owned = img["_owner_class"] == "aws-backup-vault"
+
+            action = ("Delete the recovery point in the AWS Backup vault - this removes the "
+                      "AMI and its snapshots together"
+                      if backup_owned else
+                      "Deregister the AMI, then delete the snapshots listed for it")
+
+            ami_rows.append({
                 "Profile": profile,
                 "AccountId": account_id,
                 "Region": region,
-                "SnapshotId": s["SnapshotId"],
-                "SourceVolumeId": s.get("VolumeId", ""),
-                "SizeGiB": size,
-                "StartDate": started.strftime("%Y-%m-%d") if started else "",
-                "AgeDays": age,
-                "Name": tag_value(s.get("Tags"), "Name"),
-                "Description": (s.get("Description") or "")[:70],
-                "EstMonthlyUSD": round(size * GB_MONTH_USD, 2),
-                "SafeToDelete": "YES",
-                "Reason": build_reason(age, min_age_days),
+                "AmiId": img["ImageId"],
+                "AmiName": (img.get("Name") or "")[:60],
+                "AmiCreated": img["_created"].strftime("%Y-%m-%d"),
+                "AmiAgeDays": age,
+                "AmiOwner": img["_owner_class"],
+                "SourceResource": key,
+                "AmisInGroup": group_size,
+                "NewerAmisKept": len(kept),
+                "NewestKeptAmi": kept[0]["ImageId"] if kept else "",
+                "NewestKeptDate": kept[0]["_created"].strftime("%Y-%m-%d") if kept else "",
+                "InUse": "No",
+                "SnapshotCount": len(free_now),
+                "SnapshotGiB": total_gb,
+                "EstMonthlyUSD": round(total_gb * GB_MONTH_USD, 2),
+                "Action": action,
             })
+
+            for sid, s, s_age in free_now:
+                size = s.get("VolumeSize", 0)
+                snap_rows.append({
+                    "Profile": profile,
+                    "AccountId": account_id,
+                    "Region": region,
+                    "SnapshotId": sid,
+                    "HeldByAmi": img["ImageId"],
+                    "SourceResource": key,
+                    "SizeGiB": size,
+                    "StartDate": s["StartTime"].strftime("%Y-%m-%d"),
+                    "AgeDays": s_age,
+                    "EstMonthlyUSD": round(size * GB_MONTH_USD, 2),
+                    "Action": ("Freed when the AWS Backup recovery point is deleted"
+                               if backup_owned else
+                               "Delete after the AMI above is deregistered"),
+                })
+
     except Exception as e:
         print(f"  [ERROR] {profile}/{region}: {type(e).__name__}: {e}")
-    return rows, skipped, warnings
+    return ami_rows, snap_rows, skipped, warnings
 
 
 # ----------- Report writers -----------
-def write_csv(rows, path):
+def write_csv(rows, columns, path):
     with open(path, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=COLUMNS)
+        w = csv.DictWriter(f, fieldnames=columns)
         w.writeheader()
         w.writerows(rows)
     return path
 
 
-def write_xlsx(rows, path, min_age_days, skipped, warnings):
+def write_xlsx(path, ami_rows, snap_rows, min_age_days, keep, skipped, warnings):
     try:
         from openpyxl import Workbook
         from openpyxl.styles import Alignment, Font, PatternFill
@@ -300,19 +394,18 @@ def write_xlsx(rows, path, min_age_days, skipped, warnings):
         return None
 
     head_fill = PatternFill("solid", fgColor="1F3864")
-    ok_fill = PatternFill("solid", fgColor="C6EFCE")
+    backup_fill = PatternFill("solid", fgColor="FFEB9C")
     bold_white = Font(bold=True, color="FFFFFF")
 
-    total_gb = sum(r["SizeGiB"] for r in rows)
+    total_gb = sum(r["SnapshotGiB"] for r in ami_rows)
     monthly = round(total_gb * GB_MONTH_USD, 2)
-    total_seen = len(rows) + sum(skipped.values())
+    self_amis = [r for r in ami_rows if r["AmiOwner"] == "self"]
+    backup_amis = [r for r in ami_rows if r["AmiOwner"] == "aws-backup-vault"]
 
     wb = Workbook()
-
-    # --- Summary sheet ---
     ws = wb.active
     ws.title = "Summary"
-    ws["A1"] = "Safe-to-Delete EBS Snapshot Report"
+    ws["A1"] = "Old AMI and Snapshot Cleanup Report"
     ws["A1"].font = Font(bold=True, size=14)
     ws["A2"] = "Generated: " + datetime.now().strftime("%d-%b-%Y %H:%M")
     ws["A2"].font = Font(italic=True, size=9)
@@ -323,19 +416,25 @@ def write_xlsx(rows, path, min_age_days, skipped, warnings):
         c.font = bold_white
         c.fill = head_fill
     for metric, val in [
-        ("Snapshots examined", total_seen),
-        ("Accounts with findings", len({r["AccountId"] for r in rows})),
-        ("Regions with findings", len({r["Region"] for r in rows})),
-        ("Snapshots confirmed safe to delete", len(rows)),
+        ("Age threshold (days)", min_age_days),
+        ("Newest AMIs kept per source resource", keep),
+        ("", ""),
+        ("AMIs safe to remove", len(ami_rows)),
+        ("  of which self-owned (deregister directly)", len(self_amis)),
+        ("  of which AWS Backup owned (delete recovery point)", len(backup_amis)),
+        ("Source resources affected", len({r["SourceResource"] for r in ami_rows})),
+        ("Accounts with findings", len({r["AccountId"] for r in ami_rows})),
+        ("Regions with findings", len({r["Region"] for r in ami_rows})),
+        ("", ""),
+        ("Snapshots freed", len(snap_rows)),
         ("Reclaimable storage (GiB)", total_gb),
         ("Estimated monthly saving (USD)", monthly),
         ("Estimated annual saving (USD)", round(monthly * 12, 2)),
-        ("Minimum age threshold (days)", min_age_days),
     ]:
         ws.append([metric, val])
 
     ws.append([])
-    ws.append(["Snapshots excluded from this report", "Count"])
+    ws.append(["AMIs excluded from this report", "Count"])
     for c in ws[ws.max_row]:
         c.font = bold_white
         c.fill = head_fill
@@ -343,64 +442,73 @@ def write_xlsx(rows, path, min_age_days, skipped, warnings):
         ws.append([label, skipped.get(key, 0)])
 
     ws.append([])
-    ws.append(["Deletion criteria applied to every snapshot listed in this report:"])
+    ws.append(["Safety rules applied to every AMI listed"])
     ws[ws.max_row][0].font = Font(bold=True)
     for line in [
-        "1. No AMI in this account references the snapshot. Deprecated and disabled AMIs "
-        "are included in this check, because a disabled AMI still blocks deletion and is "
-        "hidden from the console's default 'Owned by me' filter.",
-        "2. No existing EBS volume was created from the snapshot.",
-        "3. The snapshot is older than the age threshold shown above.",
-        "4. The snapshot state is 'completed'.",
-        "5. The snapshot is not managed by AWS Backup or Data Lifecycle Manager. Such "
-        "snapshots cannot be deleted from the EC2 console at all.",
-        "6. The snapshot is not protected by an EBS snapshot lock.",
-        "7. The snapshot is not public and is not shared with any other AWS account.",
+        f"1. The AMI is older than {min_age_days} days.",
+        f"2. Its source resource still has newer AMIs. The {keep} most recent AMIs of every "
+        "source resource are kept and never appear in this report, so no resource is left "
+        "without a current image.",
+        "3. A source resource that has only its recent AMIs contributes nothing to this report.",
+        "4. The AMI is not referenced by any instance, launch template, or launch configuration.",
+        f"5. Every snapshot held by the AMI is also older than {min_age_days} days. If even one "
+        "is newer, the whole AMI is excluded.",
+        "6. Snapshots that are also held by an AMI being kept are never listed for deletion.",
+        "7. An AMI whose source resource could not be identified is never listed, because its "
+        "retention group cannot be verified.",
     ]:
         ws.append([line])
 
     ws.append([])
-    ws.append(["Scope note: AMI ownership is checked within each account separately. "
-               "Cross-account AMI usage of shared snapshots is not evaluated."])
+    ws.append(["Order of operations"])
+    ws[ws.max_row][0].font = Font(bold=True)
+    for line in [
+        "Self-owned AMIs: deregister the AMI first, then delete its snapshots. A snapshot "
+        "cannot be deleted while any registered AMI still references it.",
+        "AWS Backup owned AMIs: do not deregister them directly. Delete the corresponding "
+        "recovery point in the backup vault, which removes the AMI and its snapshots together.",
+        "Cost is estimated at $0.05/GiB-month against the snapshot's provisioned volume size. "
+        "EBS snapshots are incremental, so actual billed storage is lower. Treat these figures "
+        "as an upper bound for prioritisation, not as a billing reconciliation.",
+    ]:
+        ws.append([line])
 
     if warnings:
         ws.append([])
         ws.append(["Warnings raised during the scan"])
         ws[ws.max_row][0].font = Font(bold=True, color="C00000")
-        for w in sorted(set(warnings)):
+        for w in sorted(set(warnings))[:60]:
             ws.append([w])
 
-    ws.column_dimensions["A"].width = 58
-    ws.column_dimensions["B"].width = 18
+    ws.column_dimensions["A"].width = 62
+    ws.column_dimensions["B"].width = 16
 
-    # --- Detail sheet ---
-    if not rows:
-        wb.save(path)
-        return path
+    def add_sheet(title, rows, columns, caps, backup_col=None):
+        if not rows:
+            return
+        sh = wb.create_sheet(title)
+        sh.append(columns)
+        for c in sh[1]:
+            c.font = bold_white
+            c.fill = head_fill
+            c.alignment = Alignment(horizontal="center")
+        acct_col = columns.index("AccountId") + 1
+        for r in rows:
+            sh.append([r[c] for c in columns])
+            sh.cell(row=sh.max_row, column=acct_col).number_format = "@"
+            if backup_col and r.get("AmiOwner") == "aws-backup-vault":
+                sh.cell(row=sh.max_row, column=columns.index(backup_col) + 1).fill = backup_fill
+        for i, col in enumerate(columns, 1):
+            widest = max([len(col)] + [len(str(r[col])) for r in rows])
+            sh.column_dimensions[get_column_letter(i)].width = min(widest + 3, caps.get(col, 16))
+        sh.freeze_panes = "A2"
+        sh.auto_filter.ref = sh.dimensions
 
-    ds = wb.create_sheet("Safe To Delete")
-    ds.append(COLUMNS)
-    for c in ds[1]:
-        c.font = bold_white
-        c.fill = head_fill
-        c.alignment = Alignment(horizontal="center")
-
-    safe_col = COLUMNS.index("SafeToDelete") + 1
-    acct_col = COLUMNS.index("AccountId") + 1
-    for r in rows:
-        ds.append([r[c] for c in COLUMNS])
-        cell = ds.cell(row=ds.max_row, column=safe_col)
-        cell.fill = ok_fill
-        cell.font = Font(bold=True)
-        ds.cell(row=ds.max_row, column=acct_col).number_format = "@"
-
-    caps = {"Reason": 70, "Description": 40, "SnapshotId": 24,
-            "SourceVolumeId": 24, "Profile": 26}
-    for i, col in enumerate(COLUMNS, 1):
-        widest = max([len(col)] + [len(str(r[col])) for r in rows])
-        ds.column_dimensions[get_column_letter(i)].width = min(widest + 3, caps.get(col, 16))
-    ds.freeze_panes = "A2"
-    ds.auto_filter.ref = ds.dimensions
+    add_sheet("AMIs To Remove", ami_rows, AMI_COLUMNS,
+              {"Action": 60, "AmiName": 40, "SourceResource": 26, "Profile": 26},
+              backup_col="AmiOwner")
+    add_sheet("Snapshots Freed", snap_rows, SNAP_COLUMNS,
+              {"Action": 50, "SourceResource": 26, "Profile": 26})
 
     wb.save(path)
     return path
@@ -410,16 +518,23 @@ def write_xlsx(rows, path, min_age_days, skipped, warnings):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--min-age-days", type=int, default=DEFAULT_MIN_AGE_DAYS,
-                    help=f"only report snapshots older than N days (default {DEFAULT_MIN_AGE_DAYS})")
+                    help=f"only consider AMIs and snapshots older than N days "
+                         f"(default {DEFAULT_MIN_AGE_DAYS})")
+    ap.add_argument("--keep", type=int, default=DEFAULT_KEEP,
+                    help=f"newest AMIs to keep per source resource (default {DEFAULT_KEEP})")
     ap.add_argument("--region", help="scan a single region instead of all")
     ap.add_argument("--profile", action="append", help="limit to specific profile(s); repeatable")
     ap.add_argument("--workers", type=int, default=12)
     ap.add_argument("--outdir", default=".")
     args = ap.parse_args()
 
+    if args.keep < 1:
+        print("--keep must be at least 1; every source resource must retain a current AMI.")
+        sys.exit(1)
+
     print("=" * 78)
-    print("SAFE-TO-DELETE EBS SNAPSHOT FINDER   (read-only)")
-    print(f"Age threshold: snapshots older than {args.min_age_days} days")
+    print("OLD AMI AND SNAPSHOT CLEANUP REPORT   (read-only)")
+    print(f"Age threshold: {args.min_age_days} days | Keeping newest {args.keep} AMIs per resource")
     print("=" * 78)
 
     profiles = args.profile or get_all_profiles()
@@ -434,65 +549,66 @@ def main():
 
     print(f"Scanning {len(jobs)} profile/region combinations...\n")
 
-    rows, warnings = [], []
+    ami_rows, snap_rows, warnings = [], [], []
     skipped = {k: 0 for k, _ in SKIP_KEYS}
     with ThreadPoolExecutor(max_workers=args.workers) as ex:
-        futs = [ex.submit(scan_region, p, a, r, args.min_age_days) for p, a, r in jobs]
+        futs = [ex.submit(scan_region, p, a, r, args.min_age_days, args.keep)
+                for p, a, r in jobs]
         for i, fut in enumerate(as_completed(futs), 1):
-            r, sk, wn = fut.result()
-            rows.extend(r)
+            ar, sr, sk, wn = fut.result()
+            ami_rows.extend(ar)
+            snap_rows.extend(sr)
             warnings.extend(wn)
             for k in skipped:
                 skipped[k] += sk.get(k, 0)
             print(f"\r  progress: {i}/{len(jobs)}", end="", flush=True)
     print("\n")
 
-    total_seen = len(rows) + sum(skipped.values())
+    total_gb = sum(r["SnapshotGiB"] for r in ami_rows)
     print("-" * 78)
-    print(f"Snapshots examined       : {total_seen}")
-    print(f"Confirmed safe to delete : {len(rows)}")
+    print(f"AMIs safe to remove      : {len(ami_rows)}")
+    print(f"  self-owned             : {sum(1 for r in ami_rows if r['AmiOwner'] == 'self')}")
+    print(f"  AWS Backup owned       : "
+          f"{sum(1 for r in ami_rows if r['AmiOwner'] == 'aws-backup-vault')}")
+    print(f"Snapshots freed          : {len(snap_rows)}")
+    print(f"Reclaimable storage      : {total_gb} GiB")
+    print(f"Estimated saving         : ${round(total_gb * GB_MONTH_USD, 2)}/month  "
+          f"(${round(total_gb * GB_MONTH_USD * 12, 2)}/year)")
     print("Excluded:")
     for key, label in SKIP_KEYS:
         print(f"  {label:<62}{skipped.get(key, 0):>6}")
     if warnings:
         print("Warnings:")
-        for w in sorted(set(warnings)):
+        for w in sorted(set(warnings))[:10]:
             print(f"  ! {w}")
     print("-" * 78)
 
-    if not rows:
-        print(f"\nNo snapshot met all criteria (older than {args.min_age_days} days, "
-              "no AMI, no EBS volume, not locked, not shared).")
-        if skipped.get("service_managed", 0) > total_seen * 0.5:
-            print("Most snapshots in scope are managed by AWS Backup or DLM. Those cannot "
-                  "be deleted from the EC2 console; reduce retention in the backup plan or "
-                  "delete recovery points from the vault instead.")
-        os.makedirs(args.outdir, exist_ok=True)
-        empty = os.path.join(args.outdir, f"safe_to_delete_snapshots_{TS}_summary_only.xlsx")
-        if write_xlsx([], empty, args.min_age_days, skipped, warnings):
-            print(f"\nSummary-only Excel written: {empty}")
+    os.makedirs(args.outdir, exist_ok=True)
+    base = os.path.join(args.outdir, f"old_ami_cleanup_{TS}")
+    xlsx = write_xlsx(base + ".xlsx", ami_rows, snap_rows,
+                      args.min_age_days, args.keep, skipped, warnings)
+
+    if not ami_rows:
+        print("\nNo AMI met all safety rules. See the excluded counts above.")
+        if xlsx:
+            print(f"Summary-only Excel written: {xlsx}")
         return
 
-    rows.sort(key=lambda r: (r["Profile"], r["Region"], -r["SizeGiB"]))
+    for r in sorted(ami_rows, key=lambda x: -x["SnapshotGiB"])[:15]:
+        print(f"  {r['Profile']:<24}{r['Region']:<14}{r['AmiId']:<23}"
+              f"{r['AmiAgeDays']:>5}d{r['SnapshotGiB']:>7} GiB  {r['SourceResource'][:20]}")
+    if len(ami_rows) > 15:
+        print(f"  ... plus {len(ami_rows) - 15} more, see report")
 
-    os.makedirs(args.outdir, exist_ok=True)
-    base = os.path.join(args.outdir, f"safe_to_delete_snapshots_{TS}")
-    csv_path = write_csv(rows, base + ".csv")
-    xlsx_path = write_xlsx(rows, base + ".xlsx", args.min_age_days, skipped, warnings)
-
-    total_gb = sum(r["SizeGiB"] for r in rows)
-    print(f"Reclaimable storage      : {total_gb} GiB")
-    print(f"Estimated saving         : ${round(total_gb * GB_MONTH_USD, 2)}/month  "
-          f"(${round(total_gb * GB_MONTH_USD * 12, 2)}/year)")
-    for r in rows[:15]:
-        print(f"  {r['Profile']:<24}{r['Region']:<14}{r['SnapshotId']:<24}"
-              f"{r['SizeGiB']:>6} GiB{r['AgeDays']:>6}d")
-    if len(rows) > 15:
-        print(f"  ... plus {len(rows) - 15} more, see report")
+    write_csv(ami_rows, AMI_COLUMNS, base + "_amis.csv")
+    if snap_rows:
+        write_csv(snap_rows, SNAP_COLUMNS, base + "_snapshots.csv")
     print()
-    print(f"CSV   : {csv_path}")
-    if xlsx_path:
-        print(f"Excel : {xlsx_path}")
+    print(f"CSV   : {base}_amis.csv")
+    if snap_rows:
+        print(f"CSV   : {base}_snapshots.csv")
+    if xlsx:
+        print(f"Excel : {xlsx}")
 
 
 if __name__ == "__main__":
