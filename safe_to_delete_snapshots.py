@@ -55,7 +55,7 @@ DATE_SUFFIX_RE = re.compile(
 AMI_COLUMNS = [
     "Profile", "AccountId", "Region", "AmiId", "AmiName", "AmiCreated", "AmiAgeDays",
     "AmiOwner", "SourceResource", "GroupedBy", "AmisInGroup", "RecentAmiCount",
-    "NewestAmiId", "NewestAmiDate", "InUse", "SnapshotCount", "SnapshotGiB",
+    "NewestAmiId", "NewestAmiDate", "WhyEligible", "InUse", "SnapshotCount", "SnapshotGiB",
     "EstMonthlyUSD", "Action",
 ]
 
@@ -74,8 +74,10 @@ SKIP_KEYS = [
     ("too_new", "Created inside the threshold window - never touched"),
     ("in_use", "In use by an instance, launch template, or launch configuration"),
     ("young_snapshot", "Holds at least one snapshot newer than the threshold"),
-    ("no_recent_ami", "Moved to Needs Review: no recent AMI for this source resource"),
-    ("no_group", "Moved to Needs Review: source resource could not be identified"),
+    ("orphan_resource", "Source resource no longer exists - eligible for removal"),
+    ("no_recent_ami", "Needs Review: resource still exists but has no recent AMI"),
+    ("unverifiable", "Needs Review: resource existence could not be verified"),
+    ("no_group", "Needs Review: source resource could not be identified"),
 ]
 
 
@@ -244,6 +246,30 @@ def get_amis_in_use(ec2, warnings, profile, region):
     return in_use
 
 
+def get_existing_resources(ec2, warnings, profile, region):
+    """Instance and volume IDs that still exist in this region."""
+    instances, volumes = set(), set()
+    try:
+        for page in ec2.get_paginator("describe_instances").paginate():
+            for res in page.get("Reservations", []):
+                for inst in res.get("Instances", []):
+                    if inst.get("State", {}).get("Name") != "terminated":
+                        instances.add(inst["InstanceId"])
+    except Exception as e:
+        warnings.append(f"{profile}/{region}: cannot list instances ({type(e).__name__}); "
+                        "resource existence not verified")
+        return None, None
+    try:
+        for page in ec2.get_paginator("describe_volumes").paginate():
+            for vol in page.get("Volumes", []):
+                volumes.add(vol["VolumeId"])
+    except Exception as e:
+        warnings.append(f"{profile}/{region}: cannot list volumes ({type(e).__name__}); "
+                        "volume existence not verified")
+        return instances, None
+    return instances, volumes
+
+
 def parse_created(value):
     for fmt in ("%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%dT%H:%M:%SZ"):
         try:
@@ -271,6 +297,7 @@ def scan_region(profile, account_id, region, min_age_days):
                 snap_info[s["SnapshotId"]] = s
 
         in_use = get_amis_in_use(ec2, warnings, profile, region)
+        live_instances, live_volumes = get_existing_resources(ec2, warnings, profile, region)
         now = datetime.now(timezone.utc)
 
         groups = defaultdict(list)
@@ -308,9 +335,28 @@ def scan_region(profile, account_id, region, min_age_days):
             skipped["too_new"] += len(recent)
 
             if not recent:
-                # No current image for this resource - never propose deletion
+                # The resource has no current image. Safe only if the resource itself is gone.
+                gone = None
+                if key.startswith("i-") and live_instances is not None:
+                    gone = key not in live_instances
+                elif key.startswith("vol-") and live_volumes is not None:
+                    gone = key not in live_volumes
+
+                if gone is True:
+                    skipped["orphan_resource"] += len(old)
+                    for img in old:
+                        candidates.append((img, key, len(imgs), []))
+                    continue
+
+                reason = (f"This resource still exists but has no AMI newer than "
+                          f"{min_age_days} days. Deleting its remaining images would leave it "
+                          "without a recent backup - check why backups stopped."
+                          if gone is False else
+                          "The source resource could not be matched to a live instance or "
+                          "volume, so it is not clear whether anything still depends on it.")
+                skip_key = "no_recent_ami" if gone is False else "unverifiable"
                 for img in old:
-                    skipped["no_recent_ami"] += 1
+                    skipped[skip_key] += 1
                     review_rows.append({
                         "Profile": profile, "AccountId": account_id, "Region": region,
                         "AmiId": img["ImageId"], "AmiName": (img.get("Name") or "")[:60],
@@ -319,8 +365,7 @@ def scan_region(profile, account_id, region, min_age_days):
                         "SourceResource": key, "AmisInGroup": len(imgs),
                         "SnapshotCount": len(snapshots_of(img)), "SnapshotGiB": gib(img),
                         "EstMonthlyUSD": round(gib(img) * GB_MONTH_USD, 2),
-                        "ReviewReason": f"This resource has no AMI newer than {min_age_days} "
-                                        "days. Deleting this one would leave it with no image.",
+                        "ReviewReason": reason,
                     })
                 continue
 
@@ -385,8 +430,11 @@ def scan_region(profile, account_id, region, min_age_days):
                 "AmiAgeDays": img["_age"], "AmiOwner": img["_owner_class"],
                 "SourceResource": key, "GroupedBy": img["_how"], "AmisInGroup": gsize,
                 "RecentAmiCount": len(recent),
-                "NewestAmiId": recent[0]["ImageId"],
-                "NewestAmiDate": recent[0]["_created"].strftime("%Y-%m-%d"),
+                "NewestAmiId": recent[0]["ImageId"] if recent else "",
+                "NewestAmiDate": recent[0]["_created"].strftime("%Y-%m-%d") if recent else "",
+                "WhyEligible": (f"Source resource still has {len(recent)} AMI(s) newer than "
+                                f"{min_age_days} days" if recent else
+                                "Source resource no longer exists in this region"),
                 "InUse": "No", "SnapshotCount": len(free_now), "SnapshotGiB": total_gb,
                 "EstMonthlyUSD": round(total_gb * GB_MONTH_USD, 2), "Action": action,
             })
@@ -456,6 +504,10 @@ def write_xlsx(path, ami_rows, review_rows, snap_rows, min_age_days,
          sum(1 for r in ami_rows if r["AmiOwner"] == "self")),
         ("  of which AWS Backup owned (delete recovery point)",
          sum(1 for r in ami_rows if r["AmiOwner"] == "aws-backup-vault")),
+        ("  of which source resource no longer exists",
+         sum(1 for r in ami_rows if r["RecentAmiCount"] == 0)),
+        ("  of which source resource still has a recent AMI",
+         sum(1 for r in ami_rows if r["RecentAmiCount"] > 0)),
         ("Source resources affected", len({r["SourceResource"] for r in ami_rows})),
         ("Accounts with findings", len({r["AccountId"] for r in ami_rows})),
         ("Regions with findings", len({r["Region"] for r in ami_rows})),
@@ -493,14 +545,18 @@ def write_xlsx(path, ami_rows, review_rows, snap_rows, min_age_days,
     for line in [
         f"1. The AMI is older than {min_age_days} days. Nothing created inside that window "
         "appears in this report.",
-        f"2. Its source resource has at least one AMI newer than {min_age_days} days, shown in "
-        "the NewestAmiId and NewestAmiDate columns, so the resource is never left without a "
-        "current image.",
+        f"2. Either its source resource still has an AMI newer than {min_age_days} days (shown "
+        "in the NewestAmiId and NewestAmiDate columns), or the source resource no longer exists "
+        "in the region. The WhyEligible column states which case applies to each row. A resource "
+        "that still exists but has stopped producing AMIs is never proposed for deletion.",
         "3. The AMI is not referenced by any instance, launch template, or launch configuration.",
         f"4. Every snapshot the AMI holds is also older than {min_age_days} days.",
         "5. Snapshots also referenced by an AMI that is being kept are excluded.",
-        "6. An AMI whose source resource has no recent image, or cannot be identified at all, "
-        "is listed in the Needs Review sheet instead of the deletion list.",
+        "6. An AMI whose source resource still exists but has no recent image, or whose source "
+        "resource cannot be identified or verified, is listed in the Needs Review sheet instead "
+        "of the deletion list.",
+        "7. Resource existence is checked against live instances and volumes in the same region. "
+        "Terminated instances count as gone.",
     ]:
         ws.append([line])
 
@@ -550,7 +606,8 @@ def write_xlsx(path, ami_rows, review_rows, snap_rows, min_age_days,
         sh.auto_filter.ref = sh.dimensions
 
     add_sheet("AMIs To Remove", ami_rows, AMI_COLUMNS,
-              {"Action": 58, "AmiName": 40, "SourceResource": 26, "GroupedBy": 24, "Profile": 26},
+              {"Action": 58, "AmiName": 40, "SourceResource": 26, "GroupedBy": 24,
+               "WhyEligible": 52, "Profile": 26},
               backup_col="AmiOwner")
     add_sheet("Snapshots Freed", snap_rows, SNAP_COLUMNS,
               {"Action": 48, "SourceResource": 26, "Profile": 26})
