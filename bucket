@@ -1,0 +1,519 @@
+#!/usr/bin/env python3
+"""
+AWS Backup Vault Cost Report  (READ-ONLY)
+------------------------------------------
+Scans every logged-in AWS SSO profile across all enabled regions and reports
+what AWS Backup is holding, what it costs, and which recovery points are the
+cost reduction candidates.
+
+EBS snapshots created by AWS Backup cannot be deleted from the EC2 console.
+They are deleted by removing the recovery point from the vault, or by reducing
+the retention period in the backup plan. This report supports that decision.
+
+Sheets produced:
+  Summary          - totals, cost, and the main cost drivers
+  Vault Summary    - one row per vault: recovery points, size, cost, retention
+  Old Recovery Pts - recovery points older than the age threshold (default 90d)
+  Backup Plans     - every plan rule and the retention it applies
+
+This script performs list_* and get_* calls only. Nothing is ever deleted.
+
+Usage:
+    python3 aws_backup_vault_report.py
+    python3 aws_backup_vault_report.py --min-age-days 180 --region us-west-2
+"""
+
+import argparse
+import csv
+import os
+import subprocess
+import sys
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
+
+import boto3
+from botocore.config import Config
+
+CFG = Config(retries={"max_attempts": 10, "mode": "adaptive"})
+TS = datetime.now().strftime("%Y%m%d_%H%M%S")
+GB_MONTH_USD = 0.05
+DEFAULT_MIN_AGE_DAYS = 90
+
+RP_COLUMNS = [
+    "Profile", "AccountId", "Region", "VaultName", "ResourceType", "ResourceName",
+    "CreatedDate", "AgeDays", "SizeGiB", "Status", "RetentionDays", "ExpiresOn",
+    "DaysToExpiry", "RetentionStatus", "BackupPlan", "EstMonthlyUSD", "RecoveryPointArn",
+]
+
+VAULT_COLUMNS = [
+    "Profile", "AccountId", "Region", "VaultName", "RecoveryPoints", "TotalGiB",
+    "EstMonthlyUSD", "OldestAgeDays", "NoExpiryCount", "NoExpiryGiB", "VaultLocked",
+]
+
+PLAN_COLUMNS = [
+    "Profile", "AccountId", "Region", "PlanName", "RuleName", "TargetVault",
+    "Schedule", "RetentionDays", "ColdStorageAfterDays",
+    "CopyToRegion", "CopyToVault", "CopyRetentionDays", "CopyColdAfterDays",
+]
+
+
+# ----------- Detect logged-in SSO profiles -----------
+def get_all_profiles():
+    try:
+        profiles = subprocess.check_output(
+            ["aws", "configure", "list-profiles"], text=True
+        ).splitlines()
+        profiles = [p.strip() for p in profiles if p.strip()]
+        if not profiles:
+            raise Exception("No AWS profiles found. Please configure at least one profile.")
+
+        valid_profiles = []
+        for profile in profiles:
+            try:
+                session = boto3.Session(profile_name=profile)
+                session.client("sts", config=CFG).get_caller_identity()
+                valid_profiles.append(profile)
+            except Exception:
+                print(f"  [SKIP] Profile '{profile}' not logged in or token expired.")
+
+        if not valid_profiles:
+            raise Exception(
+                "No AWS SSO profiles are currently logged in. "
+                "Run 'aws sso login --profile <profile>' for at least one profile."
+            )
+        return valid_profiles
+    except Exception as e:
+        print(f"Error detecting AWS profiles: {e}")
+        sys.exit(1)
+
+
+def get_account_id(session):
+    try:
+        return session.client("sts", config=CFG).get_caller_identity()["Account"]
+    except Exception:
+        return "unknown"
+
+
+def get_regions(session, only_region=None):
+    if only_region:
+        return [only_region]
+    try:
+        ec2 = session.client("ec2", region_name="us-east-1", config=CFG)
+        return sorted(r["RegionName"] for r in ec2.describe_regions()["Regions"])
+    except Exception as e:
+        print(f"  [WARN] describe_regions failed ({e}); using fallback region list")
+        return ["us-east-1", "us-west-2", "ap-south-1", "eu-west-1"]
+
+
+def resource_name(rp):
+    if rp.get("ResourceName"):
+        return rp["ResourceName"]
+    arn = rp.get("ResourceArn", "")
+    return arn.split("/")[-1] if arn else ""
+
+
+def paginate(client, op, key, **kwargs):
+    """Yield items for a list_* operation, handling NextToken manually."""
+    token = None
+    while True:
+        call = dict(kwargs)
+        if token:
+            call["NextToken"] = token
+        resp = getattr(client, op)(**call)
+        for item in resp.get(key, []):
+            yield item
+        token = resp.get("NextToken")
+        if not token:
+            return
+
+
+# ----------- Core scan: one profile + one region -----------
+def scan_region(profile, account_id, region, min_age_days, gb_price):
+    rp_rows, vault_rows, plan_rows, warnings = [], [], [], []
+    try:
+        backup = boto3.Session(profile_name=profile, region_name=region).client(
+            "backup", config=CFG)
+
+        try:
+            vaults = list(paginate(backup, "list_backup_vaults", "BackupVaultList"))
+        except Exception as e:
+            if "AccessDenied" in str(e) or "UnrecognizedClient" in str(e):
+                warnings.append(f"{profile}/{region}: cannot list backup vaults ({type(e).__name__})")
+            return rp_rows, vault_rows, plan_rows, warnings
+
+        now = datetime.now(timezone.utc)
+
+        for v in vaults:
+            vault_name = v["BackupVaultName"]
+            try:
+                rps = list(paginate(backup, "list_recovery_points_by_backup_vault",
+                                    "RecoveryPoints", BackupVaultName=vault_name))
+            except Exception as e:
+                warnings.append(f"{profile}/{region}/{vault_name}: "
+                                f"cannot list recovery points ({type(e).__name__})")
+                continue
+
+            v_points = v_gb = v_oldest = 0
+            no_exp_count = no_exp_gb = 0
+
+            for rp in rps:
+                created = rp.get("CreationDate")
+                age = (now - created).days if created else -1
+                size_gb = round(rp.get("BackupSizeInBytes", 0) / (1024 ** 3), 2)
+                cost = round(size_gb * gb_price, 2)
+
+                lifecycle = rp.get("Lifecycle") or {}
+                retention = lifecycle.get("DeleteAfterDays")
+                cold_after = lifecycle.get("MoveToColdStorageAfterDays")
+                delete_at = (rp.get("CalculatedLifecycle") or {}).get("DeleteAt")
+
+                if delete_at:
+                    days_to_expiry = (delete_at - now).days
+                    expires_on = delete_at.strftime("%Y-%m-%d")
+                    status_text = f"Expires in {days_to_expiry} days"
+                else:
+                    days_to_expiry = ""
+                    expires_on = ""
+                    status_text = "Never expires - no lifecycle configured"
+                    no_exp_count += 1
+                    no_exp_gb += size_gb
+
+                v_points += 1
+                v_gb += size_gb
+                v_oldest = max(v_oldest, age)
+
+                if age >= min_age_days:
+                    rp_rows.append({
+                        "Profile": profile,
+                        "AccountId": account_id,
+                        "Region": region,
+                        "VaultName": vault_name,
+                        "ResourceType": rp.get("ResourceType", ""),
+                        "ResourceName": resource_name(rp),
+                        "CreatedDate": created.strftime("%Y-%m-%d") if created else "",
+                        "AgeDays": age,
+                        "SizeGiB": size_gb,
+                        "Status": rp.get("Status", ""),
+                        "RetentionDays": retention if retention is not None else "Not set",
+                        "ExpiresOn": expires_on,
+                        "DaysToExpiry": days_to_expiry,
+                        "RetentionStatus": status_text,
+                        "BackupPlan": (rp.get("CreatedBy") or {}).get("BackupPlanName", ""),
+                        "EstMonthlyUSD": cost,
+                        "RecoveryPointArn": rp.get("RecoveryPointArn", ""),
+                    })
+
+            if v_points:
+                vault_rows.append({
+                    "Profile": profile,
+                    "AccountId": account_id,
+                    "Region": region,
+                    "VaultName": vault_name,
+                    "RecoveryPoints": v_points,
+                    "TotalGiB": round(v_gb, 2),
+                    "EstMonthlyUSD": round(v_gb * gb_price, 2),
+                    "OldestAgeDays": v_oldest,
+                    "NoExpiryCount": no_exp_count,
+                    "NoExpiryGiB": round(no_exp_gb, 2),
+                    "VaultLocked": "YES" if v.get("Locked") else "No",
+                })
+
+        # Backup plans and the retention they apply
+        try:
+            for plan in paginate(backup, "list_backup_plans", "BackupPlansList"):
+                try:
+                    detail = backup.get_backup_plan(BackupPlanId=plan["BackupPlanId"])
+                except Exception:
+                    continue
+                for rule in detail.get("BackupPlan", {}).get("Rules", []):
+                    lc = rule.get("Lifecycle") or {}
+                    base = {
+                        "Profile": profile,
+                        "AccountId": account_id,
+                        "Region": region,
+                        "PlanName": detail.get("BackupPlan", {}).get("BackupPlanName", ""),
+                        "RuleName": rule.get("RuleName", ""),
+                        "TargetVault": rule.get("TargetBackupVaultName", ""),
+                        "Schedule": rule.get("ScheduleExpression", ""),
+                        "RetentionDays": lc.get("DeleteAfterDays", "Not set"),
+                        "ColdStorageAfterDays": lc.get("MoveToColdStorageAfterDays", "Not set"),
+                        "CopyToRegion": "", "CopyToVault": "",
+                        "CopyRetentionDays": "", "CopyColdAfterDays": "",
+                    }
+                    copies = rule.get("CopyActions") or []
+                    if not copies:
+                        plan_rows.append(base)
+                        continue
+                    # A cross-region copy carries its OWN retention, which is what
+                    # keeps copies alive in the destination region.
+                    for copy in copies:
+                        arn = copy.get("DestinationBackupVaultArn", "")
+                        parts = arn.split(":")
+                        clc = copy.get("Lifecycle") or {}
+                        row = dict(base)
+                        row["CopyToRegion"] = parts[3] if len(parts) > 3 else ""
+                        row["CopyToVault"] = arn.split(":")[-1].split("/")[-1] if arn else ""
+                        row["CopyRetentionDays"] = clc.get("DeleteAfterDays", "Not set")
+                        row["CopyColdAfterDays"] = clc.get("MoveToColdStorageAfterDays", "Not set")
+                        plan_rows.append(row)
+        except Exception as e:
+            warnings.append(f"{profile}/{region}: cannot list backup plans ({type(e).__name__})")
+
+    except Exception as e:
+        print(f"  [ERROR] {profile}/{region}: {type(e).__name__}: {e}")
+    return rp_rows, vault_rows, plan_rows, warnings
+
+
+# ----------- Report writers -----------
+def write_csv(rows, columns, path):
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=columns)
+        w.writeheader()
+        w.writerows(rows)
+    return path
+
+
+def write_xlsx(path, rp_rows, vault_rows, plan_rows, min_age_days, gb_price, warnings):
+    try:
+        from openpyxl import Workbook
+        from openpyxl.styles import Alignment, Font, PatternFill
+        from openpyxl.utils import get_column_letter
+    except ImportError:
+        print("  [INFO] openpyxl not installed, Excel skipped. Install: pip install openpyxl")
+        return None
+
+    head_fill = PatternFill("solid", fgColor="1F3864")
+    warn_fill = PatternFill("solid", fgColor="FFC7CE")
+    bold_white = Font(bold=True, color="FFFFFF")
+
+    total_gb = sum(v["TotalGiB"] for v in vault_rows)
+    total_cost = round(total_gb * gb_price, 2)
+    no_exp_gb = sum(v["NoExpiryGiB"] for v in vault_rows)
+    no_exp_count = sum(v["NoExpiryCount"] for v in vault_rows)
+    old_gb = sum(r["SizeGiB"] for r in rp_rows)
+
+    by_type = defaultdict(lambda: [0, 0.0])
+    for r in rp_rows:
+        by_type[r["ResourceType"] or "Unknown"][0] += 1
+        by_type[r["ResourceType"] or "Unknown"][1] += r["SizeGiB"]
+
+    wb = Workbook()
+
+    # --- Summary ---
+    ws = wb.active
+    ws.title = "Summary"
+    ws["A1"] = "AWS Backup Vault Cost Report"
+    ws["A1"].font = Font(bold=True, size=14)
+    ws["A2"] = "Generated: " + datetime.now().strftime("%d-%b-%Y %H:%M")
+    ws["A2"].font = Font(italic=True, size=9)
+
+    ws.append([])
+    ws.append(["Metric", "Value"])
+    for c in ws[4]:
+        c.font = bold_white
+        c.fill = head_fill
+    for metric, val in [
+        ("Accounts with backup vaults", len({v["AccountId"] for v in vault_rows})),
+        ("Regions with backup vaults", len({v["Region"] for v in vault_rows})),
+        ("Backup vaults", len(vault_rows)),
+        ("Recovery points", sum(v["RecoveryPoints"] for v in vault_rows)),
+        ("Total protected size (GiB)", round(total_gb, 2)),
+        ("Estimated monthly cost (USD)", total_cost),
+        ("Estimated annual cost (USD)", round(total_cost * 12, 2)),
+        ("", ""),
+        (f"Recovery points older than {min_age_days} days", len(rp_rows)),
+        (f"Size of those recovery points (GiB)", round(old_gb, 2)),
+        ("Their estimated monthly cost (USD)", round(old_gb * gb_price, 2)),
+        ("", ""),
+        ("Recovery points with no expiry configured", no_exp_count),
+        ("Size held indefinitely (GiB)", round(no_exp_gb, 2)),
+        ("Cost of indefinite retention (USD/month)", round(no_exp_gb * gb_price, 2)),
+        ("Backup plan rules found", len(plan_rows)),
+    ]:
+        ws.append([metric, val])
+
+    if by_type:
+        ws.append([])
+        ws.append([f"Recovery points older than {min_age_days} days, by resource type", "Count", "GiB"])
+        for c in ws[ws.max_row]:
+            c.font = bold_white
+            c.fill = head_fill
+        for rtype, (cnt, gb) in sorted(by_type.items(), key=lambda x: -x[1][1]):
+            ws.append([rtype, cnt, round(gb, 2)])
+
+    ws.append([])
+    ws.append(["How to act on this report"])
+    ws[ws.max_row][0].font = Font(bold=True)
+    for line in [
+        "1. Recovery points listed as 'Never expires' are held indefinitely. Setting a "
+        "retention period on the matching backup plan rule is usually the largest saving.",
+        "2. Reducing DeleteAfterDays on a plan rule expires existing recovery points that "
+        "are already past the new retention, so the saving applies to the current backlog too.",
+        "3. Individual recovery points can be deleted from the backup vault. The EC2 console "
+        "cannot delete the underlying snapshot while AWS Backup manages it.",
+        "4. A vault marked Locked in the Vault Summary sheet enforces minimum retention. "
+        "Recovery points in it cannot be deleted before that minimum expires.",
+        "5. The Backup Plans sheet shows both retentions for every rule: RetentionDays for the "
+        "copy in the source region, and CopyRetentionDays for the cross-region copy. The two are "
+        "independent, so a short source retention with a long copy retention means the "
+        "destination region keeps data far longer than the source.",
+    ]:
+        ws.append([line])
+
+    ws.append([])
+    ws.append(["Cost basis"])
+    ws[ws.max_row][0].font = Font(bold=True)
+    for line in [
+        f"Storage is priced at ${gb_price}/GiB-month (warm tier, EBS snapshot rate). "
+        "Override with --gb-price for other rates or resource types.",
+        "Sizes come from the BackupSizeInBytes field, which reports the full protected "
+        "resource size rather than incremental storage consumed. Actual billed storage for "
+        "incremental EBS backups is lower, so these figures are an upper bound. Use them to "
+        "rank vaults and retention policies, not as a billing reconciliation.",
+        "Cold storage and archive tiers are billed at different rates and are not separated here.",
+    ]:
+        ws.append([line])
+
+    if warnings:
+        ws.append([])
+        ws.append(["Warnings raised during the scan"])
+        ws[ws.max_row][0].font = Font(bold=True, color="C00000")
+        for w in sorted(set(warnings))[:60]:
+            ws.append([w])
+
+    ws.column_dimensions["A"].width = 60
+    ws.column_dimensions["B"].width = 18
+    ws.column_dimensions["C"].width = 14
+
+    # --- Detail sheets ---
+    def add_sheet(title, rows, columns, caps, highlight=None):
+        if not rows:
+            return
+        sh = wb.create_sheet(title)
+        sh.append(columns)
+        for c in sh[1]:
+            c.font = bold_white
+            c.fill = head_fill
+            c.alignment = Alignment(horizontal="center")
+        acct_col = columns.index("AccountId") + 1 if "AccountId" in columns else None
+        for r in rows:
+            sh.append([r[c] for c in columns])
+            if acct_col:
+                sh.cell(row=sh.max_row, column=acct_col).number_format = "@"
+            if highlight and highlight(r):
+                sh.cell(row=sh.max_row, column=columns.index(highlight.col) + 1).fill = warn_fill
+        for i, col in enumerate(columns, 1):
+            widest = max([len(col)] + [len(str(r[col])) for r in rows])
+            sh.column_dimensions[get_column_letter(i)].width = min(widest + 3, caps.get(col, 16))
+        sh.freeze_panes = "A2"
+        sh.auto_filter.ref = sh.dimensions
+
+    add_sheet("Vault Summary", vault_rows, VAULT_COLUMNS,
+              {"VaultName": 38, "Profile": 26})
+
+    class NoExpiry:
+        col = "RetentionStatus"
+        def __call__(self, r):
+            return r["RetentionStatus"].startswith("Never")
+
+    add_sheet(f"Old Recovery Pts", rp_rows, RP_COLUMNS,
+              {"RecoveryPointArn": 45, "ResourceName": 30, "VaultName": 32,
+               "RetentionStatus": 34, "Profile": 26}, highlight=NoExpiry())
+
+    add_sheet("Backup Plans", plan_rows, PLAN_COLUMNS,
+              {"Schedule": 30, "PlanName": 30, "TargetVault": 32, "CopyToVault": 32,
+               "Profile": 26})
+
+    wb.save(path)
+    return path
+
+
+# ----------- Main -----------
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--min-age-days", type=int, default=DEFAULT_MIN_AGE_DAYS,
+                    help=f"list recovery points older than N days (default {DEFAULT_MIN_AGE_DAYS})")
+    ap.add_argument("--gb-price", type=float, default=GB_MONTH_USD,
+                    help=f"USD per GiB-month used for cost estimates (default {GB_MONTH_USD})")
+    ap.add_argument("--region", help="scan a single region instead of all")
+    ap.add_argument("--profile", action="append", help="limit to specific profile(s); repeatable")
+    ap.add_argument("--workers", type=int, default=12)
+    ap.add_argument("--outdir", default=".")
+    args = ap.parse_args()
+
+    print("=" * 78)
+    print("AWS BACKUP VAULT COST REPORT   (read-only)")
+    print(f"Listing recovery points older than {args.min_age_days} days")
+    print("=" * 78)
+
+    profiles = args.profile or get_all_profiles()
+    print(f"\nActive profiles: {len(profiles)}")
+
+    jobs = []
+    for p in profiles:
+        sess = boto3.Session(profile_name=p)
+        acct = get_account_id(sess)
+        for reg in get_regions(sess, args.region):
+            jobs.append((p, acct, reg))
+
+    print(f"Scanning {len(jobs)} profile/region combinations...\n")
+
+    rp_rows, vault_rows, plan_rows, warnings = [], [], [], []
+    with ThreadPoolExecutor(max_workers=args.workers) as ex:
+        futs = [ex.submit(scan_region, p, a, r, args.min_age_days, args.gb_price)
+                for p, a, r in jobs]
+        for i, fut in enumerate(as_completed(futs), 1):
+            rp, vr, pr, wn = fut.result()
+            rp_rows.extend(rp)
+            vault_rows.extend(vr)
+            plan_rows.extend(pr)
+            warnings.extend(wn)
+            print(f"\r  progress: {i}/{len(jobs)}", end="", flush=True)
+    print("\n")
+
+    total_gb = sum(v["TotalGiB"] for v in vault_rows)
+    no_exp_gb = sum(v["NoExpiryGiB"] for v in vault_rows)
+    old_gb = sum(r["SizeGiB"] for r in rp_rows)
+
+    print("-" * 78)
+    print(f"Backup vaults found        : {len(vault_rows)}")
+    print(f"Recovery points            : {sum(v['RecoveryPoints'] for v in vault_rows)}")
+    print(f"Total protected size       : {round(total_gb, 2)} GiB")
+    print(f"Estimated cost             : ${round(total_gb * args.gb_price, 2)}/month  "
+          f"(${round(total_gb * args.gb_price * 12, 2)}/year)")
+    print(f"Older than {args.min_age_days}d            : {len(rp_rows)} points | "
+          f"{round(old_gb, 2)} GiB | ${round(old_gb * args.gb_price, 2)}/month")
+    print(f"No expiry configured       : {sum(v['NoExpiryCount'] for v in vault_rows)} points | "
+          f"{round(no_exp_gb, 2)} GiB | ${round(no_exp_gb * args.gb_price, 2)}/month")
+    print(f"Backup plan rules          : {len(plan_rows)}")
+    if warnings:
+        print(f"Warnings                   : {len(set(warnings))} (see report)")
+    print("-" * 78)
+
+    if not vault_rows:
+        print("No backup vaults found in any scanned account or region.")
+        return
+
+    for v in sorted(vault_rows, key=lambda x: -x["TotalGiB"])[:10]:
+        print(f"  {v['Profile']:<26}{v['Region']:<14}{v['VaultName']:<28}"
+              f"{v['TotalGiB']:>10} GiB  ${v['EstMonthlyUSD']}/mo")
+
+    os.makedirs(args.outdir, exist_ok=True)
+    base = os.path.join(args.outdir, f"aws_backup_vault_report_{TS}")
+    write_csv(vault_rows, VAULT_COLUMNS, base + "_vaults.csv")
+    if rp_rows:
+        write_csv(rp_rows, RP_COLUMNS, base + "_recovery_points.csv")
+    xlsx = write_xlsx(base + ".xlsx", rp_rows, vault_rows, plan_rows,
+                      args.min_age_days, args.gb_price, warnings)
+
+    print()
+    print(f"CSV   : {base}_vaults.csv")
+    if rp_rows:
+        print(f"CSV   : {base}_recovery_points.csv")
+    if xlsx:
+        print(f"Excel : {xlsx}")
+
+
+if __name__ == "__main__":
+    main()
