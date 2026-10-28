@@ -1,0 +1,3 @@
+Hi Team,
+
+We verified CVE-2026-111497 on the affected RHEL 8.10 server. The security patch is available via RHSA-2026:90501, with the Brotli package update from version 1.0.6-4.el8_10 to 1.0.6-5.el8_10. The update will be applied following change approval.
