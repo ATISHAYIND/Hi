@@ -7,3 +7,10 @@ grep -iE 'PORT|HOST|LISTENER' /opt/oracle/product/19c/dbhome_1/network/admin/lis
 grep -iE 'PORT|HOST|LISTENER' /opt/oracle/product/19c/dbhome_1/network/admin/listener.ora
 
 /opt/oracle/product/19c/dbhome_1/bin/lsnrctl status
+
+
+Hi Team,
+
+As confirmed by AWS Support, the reboot was triggered from the AWS side due to a failed EC2 System Status Check. AWS automatically recovered the instance.
+
+The server is now up and running, and all health checks are passing.
