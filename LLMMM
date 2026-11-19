@@ -13,3 +13,10 @@ sar -W -f /var/log/sa/sa16 -s 22:45:00 -e 23:30:00
 sar -S -f /var/log/sa/sa16 -s 22:45:00 -e 23:30:00
 sar -q -f /var/log/sa/sa16 -s 22:45:00 -e 23:30:00
 free -h
+
+------------------
+
+
+sar -u -f /var/log/sa/sa16 -s 22:30:00 -e 23:35:00
+sar -r -f /var/log/sa/sa16 -s 22:30:00 -e 23:35:00
+sar -q -f /var/log/sa/sa16 -s 22:30:00 -e 23:35:00
