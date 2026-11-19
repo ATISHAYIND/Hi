@@ -1,17 +1,6 @@
-1. Successfully attached – 6 EC2 instances
-6 completed
-EC2 Instance	Server Name
-i-0c5f728c89838437a	PALMAWW012
-i-0945e31016d6017df	PALMAWW015
-i-09d0ffd0a58e75059	PGHBAWW013
-i-0848c3b8fb2483efc	PGHBAWW014
-i-0fb4bb3f7fd898b71	PALMAWL014
-i-05b7cc2896ffb800	PALMAWL019.ONE.AD
-
-2. Failed – 4 EC2 instances
-4 pending
-EC2 Instance	Server Name
-i-09ae9aa916c59912d	PALMAWL023.one.ad
-i-097e3bc4e188b589	PALMAWL018.one.ad
-i-093a1a7e6cdf282c1	PALMAWL022.one.ad
-i-0bca2875ed029b8bd	PAPPAWL010.one.ad
+sar -u -f /var/log/sa/sa16 -s 22:45:00 -e 23:30:00
+sar -r -f /var/log/sa/sa16 -s 22:45:00 -e 23:30:00
+sar -r -f /var/log/sa/sa16 -s 22:45:00 -e 23:30:00
+sar -P ALL -f /var/log/sa/sa16 -s 22:45:00 -e 23:30:00
+rpm -qa | grep sysstat
+systemctl status sysstat
