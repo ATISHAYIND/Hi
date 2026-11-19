@@ -4,3 +4,12 @@ sar -r -f /var/log/sa/sa16 -s 22:45:00 -e 23:30:00
 sar -P ALL -f /var/log/sa/sa16 -s 22:45:00 -e 23:30:00
 rpm -qa | grep sysstat
 systemctl status sysstat
+
+
+-------------
+
+
+sar -W -f /var/log/sa/sa16 -s 22:45:00 -e 23:30:00
+sar -S -f /var/log/sa/sa16 -s 22:45:00 -e 23:30:00
+sar -q -f /var/log/sa/sa16 -s 22:45:00 -e 23:30:00
+free -h
